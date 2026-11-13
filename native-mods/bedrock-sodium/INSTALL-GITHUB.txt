@@ -1,0 +1,9 @@
+GitHub integration could read the user's repository but returned HTTP 403 when asked to create the feature branch. No repository files were changed.
+
+To build from GitHub Actions:
+1. Copy the folder `bedrock-sodium` to `native-mods/bedrock-sodium/` in `mynameisgoodlen/LeviDroid-Modder`.
+2. Copy `.github/workflows/build-bedrock-sodium.yml` to the repository's `.github/workflows/` folder.
+3. Commit to a feature branch and run Actions -> Build Bedrock Sodium (ARMv7) -> Run workflow.
+4. Download the `bedrock-sodium-armeabi-v7a` artifact and import the `.levipack` in LeviLauncher.
+
+Do not import a raw `.so` or use an ARM64 package on the ARMv7 device.
