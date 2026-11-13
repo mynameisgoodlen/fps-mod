@@ -1,1 +1,83 @@
-yes
+name: Build Bedrock Sodium (ARMv7)
+
+on:
+  push:
+    paths:
+      - 'native-mods/bedrock-sodium/**'
+      - '.github/workflows/build-bedrock-sodium.yml'
+  pull_request:
+    paths:
+      - 'native-mods/bedrock-sodium/**'
+      - '.github/workflows/build-bedrock-sodium.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ANDROID_PLATFORM: android-28
+  ANDROID_NDK_VERSION: 28.2.13676358
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            'platform-tools' \
+            'platforms;android-28' \
+            'cmake;3.22.1' \
+            "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Configure ARMv7 build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S native-mods/bedrock-sodium -B build/bedrock-sodium-armv7 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM="${ANDROID_PLATFORM}" \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build and package
+        run: cmake --build build/bedrock-sodium-armv7 --target levi_package --parallel 2
+
+      - name: Verify ARMv7 library and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          SO='build/bedrock-sodium-armv7/libbedrock_sodium.so'
+          if [ ! -f "$SO" ]; then
+            SO="$(find build/bedrock-sodium-armv7 -name libbedrock_sodium.so -type f -print -quit)"
+          fi
+          test -n "$SO"
+          readelf -h "$SO" | tee /tmp/bedrock-sodium-elf.txt
+          grep -q 'Class:.*ELF32' /tmp/bedrock-sodium-elf.txt
+          grep -q 'Machine:.*ARM' /tmp/bedrock-sodium-elf.txt
+          PACK='build/bedrock-sodium-armv7/bedrock_sodium-0.1.0-armeabi-v7a.levipack'
+          test -s "$PACK"
+          unzip -t "$PACK"
+          unzip -Z1 "$PACK" | grep -qx 'bedrock_sodium/manifest.json'
+          unzip -Z1 "$PACK" | grep -qx 'bedrock_sodium/libbedrock_sodium.so'
+
+      - name: Upload LeviPack
+        uses: actions/upload-artifact@v4
+        with:
+          name: bedrock-sodium-armeabi-v7a
+          path: build/bedrock-sodium-armv7/bedrock_sodium-0.1.0-armeabi-v7a.levipack
+          if-no-files-found: error
+          retention-days: 30
