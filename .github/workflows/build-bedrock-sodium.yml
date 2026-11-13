@@ -1,3 +1,4 @@
+
 name: Build Bedrock Sodium (ARMv7)
 
 on:
@@ -23,21 +24,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
 
       - name: Setup Android SDK
-  uses: android-actions/setup-android@v4
-  with:
-    packages: platform-tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
       - name: Install Android toolchain
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y ninja-build
-          yes | sdkmanager --licenses >/dev/null || true
           sdkmanager \
-            'platform-tools' \
             'platforms;android-28' \
             'cmake;3.22.1' \
             "ndk;${ANDROID_NDK_VERSION}"
