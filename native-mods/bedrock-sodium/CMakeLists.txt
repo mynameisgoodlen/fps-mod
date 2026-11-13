@@ -26,15 +26,10 @@ include(FetchContent)
 FetchContent_Declare(
     preloader_android
     GIT_REPOSITORY https://github.com/LiteLDev/preloader-android.git
-    GIT_TAG 0.2.2
-    SOURCE_SUBDIR cmake/preloader-sdk
+    GIT_TAG cc08b40a31471d3e2dedb267f5f17b28da2b0604
 )
-FetchContent_MakeAvailable(preloader_android)
-FetchContent_GetProperties(preloader_android)
 
-if(NOT TARGET preloader)
-    add_subdirectory("${preloader_android_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/_preloader_android")
-endif()
+FetchContent_MakeAvailable(preloader_android)
 
 add_library(${MOD_LIBRARY_NAME} SHARED
     src/main.cpp
@@ -63,8 +58,8 @@ find_library(ANDROID_EGL_LIB EGL REQUIRED)
 find_library(ANDROID_GLES_LIB GLESv3 REQUIRED)
 find_library(ANDROID_LIB android REQUIRED)
 
-# The launcher has already loaded libpreloader.so before loading preload-native mods.
-# Linking against the target keeps the public SDK symbols and ABI declarations exact.
+# The launcher loads libpreloader.so before loading native mods.
+# Link against the matching Preloader target and headers.
 target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE
     preloader
     ${ANDROID_LOG_LIB}
