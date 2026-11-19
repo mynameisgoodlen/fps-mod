@@ -1,0 +1,735 @@
+name: build-fpsboost
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-mod.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Write mod source
+        run: |
+          mkdir -p mod out
+          cat > mod/fpsboost.c <<'FPSBOOST_EOF'
+          /*
+           * FpsBoost 0.3 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
+           *
+           * Skips selected RenderDragon frame-builder passes by hooking the tiny
+           * FrameBuilder::insert<TDescription>() wrappers (found by reverse engineering).
+           * A hooked wrapper that returns immediately means that pass is never queued.
+           *
+           * Safety:
+           *   - Only runs on the exact libminecraftpe.so build it was made for (GNU build id).
+           *   - Every hook target is byte-checked against the wrapper signature before hooking.
+           *   - Only passes you enable are hooked.
+           *
+           * v0.2 added a GLES layer that does not depend on the game build: unlock VSync, optional frame cap,
+           * and an FPS logger (average FPS + worst frame time every 5 s).
+           * v0.3 adds (a) a CPU-vs-GPU hint in the FPS log (time spent waiting inside eglSwapBuffers) and
+           * (b) EXPERIMENTAL render-resolution scaling (res_scale=50..99): the game draws into a smaller
+           * off-screen buffer that is stretched to the screen once per frame.  Off by default.
+           *
+           * Settings: optional text file  FpsBoost.cfg  (lines like  particles=1 ), looked up in
+           *   /sdcard/Download, /storage/emulated/0/Download, /sdcard and the game's own files dir.
+           *   1 = skip (disable) that pass, 0 = leave it alone.
+           * Log: FpsBoost.log in the same places (first writable one) and logcat tag "FpsBoost".
+           */
+          #define _GNU_SOURCE
+          #include <android/log.h>
+          #include <dlfcn.h>
+          #include <link.h>
+          #include <pthread.h>
+          #include <stdarg.h>
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          #define TAG "FpsBoost"
+          #define EXPORT __attribute__((visibility("default")))
+
+          /* ---- launcher preloader API (prototypes recovered from the launcher's debug info) ---- */
+          typedef void *PLFuncPtr;
+          #define PL_HOOK_PRIORITY_NORMAL 200
+          typedef int (*pl_hook_fn)(PLFuncPtr target, PLFuncPtr detour, PLFuncPtr *original, int priority);
+          typedef bool (*pl_unhook_fn)(PLFuncPtr target, PLFuncPtr detour);
+
+          /* ---- the exact game build this mod was made for ---- */
+          static const char *EXPECTED_BUILD_ID = "03222634f9e4c1c061146770baa6872988e0a0fc";
+
+          /* first 12 bytes of every insert<T>() wrapper: push {r4-r7,lr}; add r7,sp,#12; push.w r8; sub sp,#0x30; mov r5,r0 */
+          static const uint8_t WRAPPER_PREFIX[12] = {0xF0, 0xB5, 0x03, 0xAF, 0x4D, 0xF8, 0x04, 0x8D, 0x8C, 0xB0, 0x05, 0x46};
+
+          typedef void (*wrapper_fn)(void *self, const void *desc);
+
+          typedef struct {
+              const char *key;      /* config key */
+              const char *what;     /* description for the log */
+              uint32_t rva;         /* address inside libminecraftpe.so (Thumb function, bit0 added when hooking) */
+              int skip;             /* 1 = skip this pass */
+              PLFuncPtr detour;
+              wrapper_fn *orig;
+              volatile int calls;
+              int hooked;
+          } Hook;
+
+          enum { H_PARTICLES, H_FLIPBOOK, H_CELESTIAL, H_ENDSKY, H_HAND, H_ENTITIES, H_AIMASSIST, H_COUNT };
+
+          static void det_particles(void *, const void *);
+          static void det_flipbook(void *, const void *);
+          static void det_celestial(void *, const void *);
+          static void det_endsky(void *, const void *);
+          static void det_hand(void *, const void *);
+          static void det_entities(void *, const void *);
+          static void det_aimassist(void *, const void *);
+          static wrapper_fn orig_particles, orig_flipbook, orig_celestial, orig_endsky, orig_hand, orig_entities, orig_aimassist;
+
+          static Hook g_hooks[H_COUNT] = {
+              [H_PARTICLES] = {"particles", "RenderParticleDescription (particles)", 0x06e57b44, 1, (PLFuncPtr)det_particles, &orig_particles, 0, 0},
+              [H_FLIPBOOK]  = {"flipbook", "BlitFlipbookTextureDescription (animated textures)", 0x073dff04, 0, (PLFuncPtr)det_flipbook, &orig_flipbook, 0, 0},
+              [H_CELESTIAL] = {"celestial", "RenderCelestialBodyDescription (sun/moon)", 0x073bbad8, 0, (PLFuncPtr)det_celestial, &orig_celestial, 0, 0},
+              [H_ENDSKY]    = {"endsky", "RenderEndSkyDescription (End sky)", 0x073bb8a0, 0, (PLFuncPtr)det_endsky, &orig_endsky, 0, 0},
+              [H_HAND]      = {"hand", "RenderItemInHandDescription (first-person hand/item)", 0x07404390, 0, (PLFuncPtr)det_hand, &orig_hand, 0, 0},
+              [H_ENTITIES]  = {"entities", "RenderBatchActorDescription (batched entities - they become invisible!)", 0x06a490ec, 0, (PLFuncPtr)det_entities, &orig_entities, 0, 0},
+              [H_AIMASSIST] = {"aimassist", "RenderCameraAimAssistHighlightDescription", 0x073bbccc, 0, (PLFuncPtr)det_aimassist, &orig_aimassist, 0, 0},
+          };
+
+          static volatile int g_active = 1;
+          static int g_state = 0; /* 0 = not tried, 1 = done (hooks installed or gave up for good) */
+          static pl_hook_fn g_pl_hook;
+          static pl_unhook_fn g_pl_unhook;
+          static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+          static char g_pkg[128];
+
+          /* GLES layer settings (config keys: vsync_off, fps_cap, fps_log) */
+          static int g_vsync_off = 1;
+          static int g_fps_cap = 0;   /* 0 = unlimited */
+          static int g_fps_log = 1;
+          static unsigned g_log_interval_ms = 5000;
+          typedef unsigned int (*egl_swap_fn)(void *dpy, void *surf);
+          typedef unsigned int (*egl_interval_fn)(void *dpy, int interval);
+          static egl_swap_fn orig_swap;
+          static egl_interval_fn p_swap_interval;
+          static int g_gl_done;
+          static int g_cfg_loaded;
+
+          /* experimental resolution scaling */
+          static int g_res_pct = 100;     /* 100 = off */
+          static int g_res_filter = 1;    /* 1 = linear, 0 = nearest */
+          enum { RES_OFF = 0, RES_WAIT = 1, RES_READY = 2, RES_FAILED = 3 };
+          static int g_res_state = RES_OFF;
+          static unsigned g_vfbo, g_vcolor, g_vdepth;
+          static int g_vw, g_vh, g_sw, g_sh;
+          static unsigned g_game_draw, g_game_read;   /* what the game believes is bound (0 = default framebuffer) */
+          typedef void (*gl_bindfb_fn)(unsigned target, unsigned fb);
+          typedef void (*gl_rect_fn)(int x, int y, int w, int h);
+          typedef void (*gl_blit_fn)(int, int, int, int, int, int, int, int, unsigned mask, unsigned filter);
+          static gl_bindfb_fn orig_bindfb;
+          static gl_rect_fn orig_viewport, orig_scissor;
+          static gl_blit_fn orig_blit;
+          static void (*p_glGenFramebuffers)(int, unsigned *);
+          static void (*p_glGenRenderbuffers)(int, unsigned *);
+          static void (*p_glDeleteFramebuffers)(int, const unsigned *);
+          static void (*p_glDeleteRenderbuffers)(int, const unsigned *);
+          static void (*p_glBindRenderbuffer)(unsigned, unsigned);
+          static void (*p_glRenderbufferStorage)(unsigned, unsigned, int, int);
+          static void (*p_glFramebufferRenderbuffer)(unsigned, unsigned, unsigned, unsigned);
+          static unsigned (*p_glCheckFramebufferStatus)(unsigned);
+          static void (*p_glGetIntegerv)(unsigned, int *);
+          static unsigned char (*p_glIsEnabled)(unsigned);
+          static void (*p_glEnable)(unsigned);
+          static void (*p_glDisable)(unsigned);
+          static unsigned (*p_eglQuerySurface)(void *, void *, int, int *);
+          #define GLC_FRAMEBUFFER 0x8D40u
+          #define GLC_READ_FRAMEBUFFER 0x8CA8u
+          #define GLC_DRAW_FRAMEBUFFER 0x8CA9u
+          #define GLC_DRAW_FRAMEBUFFER_BINDING 0x8CA6u
+          #define GLC_READ_FRAMEBUFFER_BINDING 0x8CAAu
+          #define GLC_RENDERBUFFER 0x8D41u
+          #define GLC_RENDERBUFFER_BINDING 0x8CA7u
+          #define GLC_RGBA8 0x8058u
+          #define GLC_DEPTH24_STENCIL8 0x88F0u
+          #define GLC_COLOR_ATTACHMENT0 0x8CE0u
+          #define GLC_DEPTH_STENCIL_ATTACHMENT 0x821Au
+          #define GLC_FRAMEBUFFER_COMPLETE 0x8CD5u
+          #define GLC_SCISSOR_TEST 0x0C11u
+          #define GLC_COLOR_BUFFER_BIT 0x4000u
+          #define GLC_NEAREST 0x2600u
+          #define GLC_LINEAR 0x2601u
+          #define EGLC_HEIGHT 0x3056
+          #define EGLC_WIDTH 0x3057
+
+          /* ------------------------------------------------------------------ logging */
+          static const char *LOG_DIRS[] = {"/sdcard/Download", "/storage/emulated/0/Download", "/sdcard", NULL};
+
+          static void load_pkg(void) {
+              if (g_pkg[0]) return;
+              FILE *f = fopen("/proc/self/cmdline", "r");
+              if (!f) return;
+              size_t n = fread(g_pkg, 1, sizeof(g_pkg) - 1, f);
+              g_pkg[n] = 0;
+              fclose(f);
+          }
+
+          static void flog(const char *fmt, ...) {
+              char msg[600];
+              va_list ap;
+              va_start(ap, fmt);
+              vsnprintf(msg, sizeof(msg), fmt, ap);
+              va_end(ap);
+              __android_log_write(ANDROID_LOG_INFO, TAG, msg);
+
+              load_pkg();
+              char path[300];
+              FILE *f = NULL;
+              for (int i = 0; LOG_DIRS[i] && !f; i++) {
+                  snprintf(path, sizeof(path), "%s/FpsBoost.log", LOG_DIRS[i]);
+                  f = fopen(path, "a");
+              }
+              if (!f && g_pkg[0]) {
+                  snprintf(path, sizeof(path), "/sdcard/Android/data/%s/files/FpsBoost.log", g_pkg);
+                  f = fopen(path, "a");
+              }
+              if (f) {
+                  time_t t = time(NULL);
+                  struct tm tmv;
+                  localtime_r(&t, &tmv);
+                  fprintf(f, "[%02d:%02d:%02d] %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, msg);
+                  fclose(f);
+              }
+          }
+
+          /* ------------------------------------------------------------------ detours */
+          #define DEFINE_DETOUR(NAME, IDX)                                                   \
+              static void det_##NAME(void *self, const void *desc) {                         \
+                  if (__sync_fetch_and_add(&g_hooks[IDX].calls, 1) == 0)                     \
+                      flog("hook active, first call: %s", g_hooks[IDX].key);                 \
+                  if (g_active && g_hooks[IDX].skip) return;                                 \
+                  if (orig_##NAME) orig_##NAME(self, desc);                                  \
+              }
+
+          DEFINE_DETOUR(particles, H_PARTICLES)
+          DEFINE_DETOUR(flipbook, H_FLIPBOOK)
+          DEFINE_DETOUR(celestial, H_CELESTIAL)
+          DEFINE_DETOUR(endsky, H_ENDSKY)
+          DEFINE_DETOUR(hand, H_HAND)
+          DEFINE_DETOUR(entities, H_ENTITIES)
+          DEFINE_DETOUR(aimassist, H_AIMASSIST)
+
+          /* ------------------------------------------------------------------ config */
+          static void apply_config_line(char *line) {
+              char *hash = strchr(line, '#');
+              if (hash) *hash = 0;
+              char *eq = strchr(line, '=');
+              if (!eq) return;
+              *eq = 0;
+              char *k = line, *v = eq + 1;
+              while (*k == ' ' || *k == '\t') k++;
+              char *e = k + strlen(k);
+              while (e > k && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
+              while (*v == ' ' || *v == '\t') v++;
+              int val = atoi(v);
+              if (strcmp(k, "vsync_off") == 0) { g_vsync_off = val ? 1 : 0; return; }
+              if (strcmp(k, "fps_cap") == 0) { g_fps_cap = val < 0 ? 0 : (val > 1000 ? 1000 : val); return; }
+              if (strcmp(k, "fps_log") == 0) { g_fps_log = val ? 1 : 0; return; }
+              if (strcmp(k, "res_scale") == 0) { g_res_pct = val < 25 ? 25 : (val > 100 ? 100 : val); return; }
+              if (strcmp(k, "res_filter") == 0) { g_res_filter = val ? 1 : 0; return; }
+              for (int i = 0; i < H_COUNT; i++) {
+                  if (strcmp(k, g_hooks[i].key) == 0) {
+                      g_hooks[i].skip = val ? 1 : 0;
+                      return;
+                  }
+              }
+          }
+
+          static void load_config(void) {
+              load_pkg();
+              char path[300];
+              FILE *f = NULL;
+              for (int i = 0; LOG_DIRS[i] && !f; i++) {
+                  snprintf(path, sizeof(path), "%s/FpsBoost.cfg", LOG_DIRS[i]);
+                  f = fopen(path, "r");
+              }
+              if (!f && g_pkg[0]) {
+                  snprintf(path, sizeof(path), "/sdcard/Android/data/%s/files/FpsBoost.cfg", g_pkg);
+                  f = fopen(path, "r");
+              }
+              if (!f) {
+                  flog("no FpsBoost.cfg found, using defaults (particles=1, vsync_off=1, fps_log=1, everything else 0)");
+                  return;
+              }
+              flog("config: %s", path);
+              char line[200];
+              while (fgets(line, sizeof(line), f)) apply_config_line(line);
+              fclose(f);
+          }
+
+          static void ensure_config(void) {
+              if (g_cfg_loaded) return;
+              g_cfg_loaded = 1;
+              load_config();
+          }
+
+          /* ------------------------------------------------------------------ game module */
+          typedef struct {
+              bool found;
+              uintptr_t base;
+              char name[256];
+              char build_id[96];
+          } ModInfo;
+
+          static int phdr_cb(struct dl_phdr_info *info, size_t sz, void *data) {
+              (void)sz;
+              ModInfo *m = (ModInfo *)data;
+              if (!info->dlpi_name || !strstr(info->dlpi_name, "libminecraftpe.so")) return 0;
+              m->found = true;
+              m->base = (uintptr_t)info->dlpi_addr;
+              snprintf(m->name, sizeof(m->name), "%s", info->dlpi_name);
+              for (int i = 0; i < info->dlpi_phnum; i++) {
+                  const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+                  if (ph->p_type != PT_NOTE || ph->p_memsz == 0 || ph->p_memsz > 4096) continue;
+                  const uint8_t *p = (const uint8_t *)(info->dlpi_addr + ph->p_vaddr);
+                  size_t off = 0, len = ph->p_memsz;
+                  while (off + 12 <= len) {
+                      uint32_t namesz = *(const uint32_t *)(p + off);
+                      uint32_t descsz = *(const uint32_t *)(p + off + 4);
+                      uint32_t type = *(const uint32_t *)(p + off + 8);
+                      size_t noff = off + 12;
+                      size_t doff = noff + ((namesz + 3u) & ~3u);
+                      size_t next = doff + ((descsz + 3u) & ~3u);
+                      if (next > len) break;
+                      if (type == 3 && namesz == 4 && memcmp(p + noff, "GNU", 4) == 0 && descsz * 2 + 1 < sizeof(m->build_id)) {
+                          for (uint32_t j = 0; j < descsz; j++) snprintf(m->build_id + j * 2, 3, "%02x", p[doff + j]);
+                      }
+                      off = next;
+                  }
+              }
+              return 1;
+          }
+
+          static void resolve_preloader(void) {
+              g_pl_hook = (pl_hook_fn)dlsym(RTLD_DEFAULT, "pl_hook");
+              g_pl_unhook = (pl_unhook_fn)dlsym(RTLD_DEFAULT, "pl_unhook");
+              if (g_pl_hook) return;
+              void *h = dlopen("libpreloader.so", RTLD_NOW | RTLD_NOLOAD);
+              if (!h) {
+                  FILE *f = fopen("/proc/self/maps", "r");
+                  char line[512];
+                  while (f && fgets(line, sizeof(line), f)) {
+                      char *p = strstr(line, "libpreloader.so");
+                      if (!p) continue;
+                      char *start = strchr(line, '/');
+                      char *nl = strchr(line, '\n');
+                      if (start && nl) {
+                          *nl = 0;
+                          h = dlopen(start, RTLD_NOW | RTLD_NOLOAD);
+                          if (h) break;
+                      }
+                  }
+                  if (f) fclose(f);
+              }
+              if (h) {
+                  g_pl_hook = (pl_hook_fn)dlsym(h, "pl_hook");
+                  g_pl_unhook = (pl_unhook_fn)dlsym(h, "pl_unhook");
+              }
+          }
+
+          /* returns 1 when finished (installed or gave up for good), 0 when the game library is not loaded yet */
+          static int try_install(void) {
+              pthread_mutex_lock(&g_lock);
+              if (g_state) {
+                  pthread_mutex_unlock(&g_lock);
+                  return 1;
+              }
+              ModInfo m;
+              memset(&m, 0, sizeof(m));
+              dl_iterate_phdr(phdr_cb, &m);
+              if (!m.found) {
+                  pthread_mutex_unlock(&g_lock);
+                  return 0;
+              }
+              g_state = 1;
+              flog("FpsBoost 0.3: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
+                   m.build_id[0] ? m.build_id : "(unreadable)");
+              if (m.build_id[0] && strcmp(m.build_id, EXPECTED_BUILD_ID) != 0) {
+                  flog("UNSUPPORTED game build (expected %s). Nothing was hooked.", EXPECTED_BUILD_ID);
+                  pthread_mutex_unlock(&g_lock);
+                  return 1;
+              }
+              resolve_preloader();
+              if (!g_pl_hook) {
+                  flog("pl_hook not found in this process - cannot install hooks.");
+                  pthread_mutex_unlock(&g_lock);
+                  return 1;
+              }
+              ensure_config();
+              int ok = 0, want = 0;
+              for (int i = 0; i < H_COUNT; i++) {
+                  Hook *h = &g_hooks[i];
+                  if (!h->skip) continue;
+                  want++;
+                  const uint8_t *code = (const uint8_t *)(m.base + h->rva);
+                  if (memcmp(code, WRAPPER_PREFIX, sizeof(WRAPPER_PREFIX)) != 0) {
+                      flog("SKIPPED %s: bytes at 0x%08x do not match the wrapper signature", h->key, h->rva);
+                      continue;
+                  }
+                  PLFuncPtr target = (PLFuncPtr)(m.base + h->rva + 1u); /* +1 = Thumb */
+                  int r = g_pl_hook(target, h->detour, (PLFuncPtr *)h->orig, PL_HOOK_PRIORITY_NORMAL);
+                  flog("hook %-9s target=%p ret=%d orig=%p  [%s]", h->key, target, r, (void *)*h->orig, h->what);
+                  h->hooked = 1;
+                  ok++;
+              }
+              flog("done: %d of %d requested hooks installed", ok, want);
+              pthread_mutex_unlock(&g_lock);
+              return 1;
+          }
+
+
+          /* ------------------------------------------------------------------ GLES layer (build independent) */
+          static uint64_t now_ns(void) {
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+          }
+
+          /* ---- resolution scaling: coordinate helpers (pure, unit-tested) */
+          static int scale_v(int v, int virt, int real) {
+              return real > 0 ? (int)(((long long)v * virt) / real) : v;
+          }
+          static void scale_rect(int *x, int *y, int *w, int *h) {
+              int x0 = scale_v(*x, g_vw, g_sw), y0 = scale_v(*y, g_vh, g_sh);
+              int x1 = scale_v(*x + *w, g_vw, g_sw), y1 = scale_v(*y + *h, g_vh, g_sh);
+              int nw = x1 - x0, nh = y1 - y0;
+              if (*w > 0 && nw < 1) nw = 1;
+              if (*h > 0 && nh < 1) nh = 1;
+              *x = x0; *y = y0; *w = nw; *h = nh;
+          }
+          static int default_draw_virtual(void) { return g_res_state == RES_READY && g_game_draw == 0; }
+
+          static void det_bindfb(unsigned target, unsigned fb) {
+              if (target == GLC_FRAMEBUFFER || target == GLC_DRAW_FRAMEBUFFER) g_game_draw = fb;
+              if (target == GLC_FRAMEBUFFER || target == GLC_READ_FRAMEBUFFER) g_game_read = fb;
+              if (g_res_state == RES_READY && fb == 0) fb = g_vfbo;
+              orig_bindfb(target, fb);
+          }
+          static void det_viewport(int x, int y, int w, int h) {
+              if (default_draw_virtual()) scale_rect(&x, &y, &w, &h);
+              orig_viewport(x, y, w, h);
+          }
+          static void det_scissor(int x, int y, int w, int h) {
+              if (default_draw_virtual()) scale_rect(&x, &y, &w, &h);
+              orig_scissor(x, y, w, h);
+          }
+          static void det_blit(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1, unsigned mask, unsigned filter) {
+              if (default_draw_virtual()) {
+                  dx0 = scale_v(dx0, g_vw, g_sw); dx1 = scale_v(dx1, g_vw, g_sw);
+                  dy0 = scale_v(dy0, g_vh, g_sh); dy1 = scale_v(dy1, g_vh, g_sh);
+              }
+              if (g_res_state == RES_READY && g_game_read == 0) {
+                  sx0 = scale_v(sx0, g_vw, g_sw); sx1 = scale_v(sx1, g_vw, g_sw);
+                  sy0 = scale_v(sy0, g_vh, g_sh); sy1 = scale_v(sy1, g_vh, g_sh);
+              }
+              orig_blit(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter);
+          }
+
+          static void res_destroy(void) {
+              if (g_vfbo && p_glDeleteFramebuffers) p_glDeleteFramebuffers(1, &g_vfbo);
+              if (g_vcolor && p_glDeleteRenderbuffers) p_glDeleteRenderbuffers(1, &g_vcolor);
+              if (g_vdepth && p_glDeleteRenderbuffers) p_glDeleteRenderbuffers(1, &g_vdepth);
+              g_vfbo = g_vcolor = g_vdepth = 0;
+          }
+
+          /* create the small off-screen buffer; GL context must be current. returns 1 on success */
+          static int res_create(int sw, int sh) {
+              int vw = (sw * g_res_pct / 100) & ~1, vh = (sh * g_res_pct / 100) & ~1;
+              if (vw < 64) vw = 64;
+              if (vh < 64) vh = 64;
+              int prev_draw = 0, prev_read = 0, prev_rb = 0;
+              p_glGetIntegerv(GLC_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+              p_glGetIntegerv(GLC_READ_FRAMEBUFFER_BINDING, &prev_read);
+              p_glGetIntegerv(GLC_RENDERBUFFER_BINDING, &prev_rb);
+              p_glGenFramebuffers(1, &g_vfbo);
+              p_glGenRenderbuffers(1, &g_vcolor);
+              p_glGenRenderbuffers(1, &g_vdepth);
+              p_glBindRenderbuffer(GLC_RENDERBUFFER, g_vcolor);
+              p_glRenderbufferStorage(GLC_RENDERBUFFER, GLC_RGBA8, vw, vh);
+              p_glBindRenderbuffer(GLC_RENDERBUFFER, g_vdepth);
+              p_glRenderbufferStorage(GLC_RENDERBUFFER, GLC_DEPTH24_STENCIL8, vw, vh);
+              orig_bindfb(GLC_FRAMEBUFFER, g_vfbo);
+              p_glFramebufferRenderbuffer(GLC_FRAMEBUFFER, GLC_COLOR_ATTACHMENT0, GLC_RENDERBUFFER, g_vcolor);
+              p_glFramebufferRenderbuffer(GLC_FRAMEBUFFER, GLC_DEPTH_STENCIL_ATTACHMENT, GLC_RENDERBUFFER, g_vdepth);
+              unsigned st = p_glCheckFramebufferStatus(GLC_FRAMEBUFFER);
+              p_glBindRenderbuffer(GLC_RENDERBUFFER, (unsigned)prev_rb);
+              orig_bindfb(GLC_DRAW_FRAMEBUFFER, (unsigned)prev_draw);
+              orig_bindfb(GLC_READ_FRAMEBUFFER, (unsigned)prev_read);
+              if (st != GLC_FRAMEBUFFER_COMPLETE) {
+                  flog("res_scale: off-screen buffer %dx%d incomplete (0x%x) - scaling disabled", vw, vh, st);
+                  res_destroy();
+                  return 0;
+              }
+              g_vw = vw; g_vh = vh; g_sw = sw; g_sh = sh;
+              flog("res_scale: rendering at %dx%d (%d%%) stretched to %dx%d", vw, vh, g_res_pct, sw, sh);
+              return 1;
+          }
+
+          /* called at the end of every frame, before the real eglSwapBuffers */
+          static void res_pre_swap(void *dpy, void *surf) {
+              int w = 0, h = 0;
+              if (g_res_state == RES_OFF || g_res_state == RES_FAILED || !p_eglQuerySurface) return;
+              if (!p_eglQuerySurface(dpy, surf, EGLC_WIDTH, &w) || !p_eglQuerySurface(dpy, surf, EGLC_HEIGHT, &h) || w <= 0 || h <= 0) return;
+              if (g_res_state == RES_READY && w == g_sw && h == g_sh) {
+                  /* stretch the small buffer onto the real default framebuffer */
+                  unsigned char sc = p_glIsEnabled(GLC_SCISSOR_TEST);
+                  if (sc) p_glDisable(GLC_SCISSOR_TEST);
+                  orig_bindfb(GLC_READ_FRAMEBUFFER, g_vfbo);
+                  orig_bindfb(GLC_DRAW_FRAMEBUFFER, 0);
+                  orig_blit(0, 0, g_vw, g_vh, 0, 0, g_sw, g_sh, GLC_COLOR_BUFFER_BIT, g_res_filter ? GLC_LINEAR : GLC_NEAREST);
+                  if (sc) p_glEnable(GLC_SCISSOR_TEST);
+                  return;
+              }
+              /* first frame, or the surface size changed: (re)create, this frame is presented unscaled */
+              if (g_res_state == RES_READY) {
+                  g_res_state = RES_WAIT;
+                  res_destroy();
+              }
+              if (res_create(w, h)) g_res_state = RES_READY;
+              else g_res_state = RES_FAILED;
+          }
+
+          /* after the real swap: put the bindings back the way the game expects them */
+          static void res_post_swap(void) {
+              if (g_res_state != RES_READY) return;
+              orig_bindfb(GLC_READ_FRAMEBUFFER, g_game_read ? g_game_read : g_vfbo);
+              orig_bindfb(GLC_DRAW_FRAMEBUFFER, g_game_draw ? g_game_draw : g_vfbo);
+          }
+
+          static struct {
+              uint64_t last;      /* time of the previous swap (for FPS statistics) */
+              uint64_t resume;    /* time the previous frame finished, after any cap sleep (for the cap) */
+              uint64_t win_start, worst, swap_wait;
+              unsigned frames;
+              unsigned long total;
+          } g_fs;
+
+          static unsigned int det_swap(void *dpy, void *surf) {
+              unsigned long n = ++g_fs.total;
+              if (g_vsync_off && p_swap_interval && (n == 1 || n % 90 == 0)) p_swap_interval(dpy, 0);
+              if (g_res_state != RES_OFF) res_pre_swap(dpy, surf);
+              uint64_t ta = now_ns();
+              unsigned int r = orig_swap ? orig_swap(dpy, surf) : 1u;
+              uint64_t t = now_ns();
+              if (g_res_state == RES_READY) res_post_swap();
+              if (!g_active) return r;
+
+              if (g_fs.last) {
+                  uint64_t d = t - g_fs.last;              /* full swap-to-swap interval */
+                  if (d > g_fs.worst) g_fs.worst = d;
+                  g_fs.swap_wait += t - ta;
+                  g_fs.frames++;
+              } else {
+                  g_fs.win_start = t;
+                  g_fs.resume = t;
+              }
+              g_fs.last = t;
+              if (g_fps_log && g_fs.frames && t - g_fs.win_start >= (uint64_t)g_log_interval_ms * 1000000ull) {
+                  double secs = (double)(t - g_fs.win_start) / 1e9;
+                  double frame_ms = secs * 1000.0 / g_fs.frames;
+                  double wait_ms = (double)g_fs.swap_wait / 1e6 / g_fs.frames;
+                  const char *hint = wait_ms > frame_ms * 0.35 ? "GPU/compositor-bound likely" : "CPU/render-thread-bound likely";
+                  flog("fps avg %.1f | frame %.1f ms = swap-wait %.1f + other %.1f | worst %.1f ms | %s | vsync_off=%d cap=%d res=%d%%",
+                       g_fs.frames / secs, frame_ms, wait_ms, frame_ms - wait_ms, (double)g_fs.worst / 1e6, hint, g_vsync_off,
+                       g_fps_cap, g_res_pct);
+                  g_fs.win_start = t;
+                  g_fs.frames = 0;
+                  g_fs.worst = 0;
+                  g_fs.swap_wait = 0;
+              }
+              if (g_fps_cap > 0) {
+                  uint64_t target = 1000000000ull / (uint64_t)g_fps_cap;
+                  uint64_t work = t - g_fs.resume;         /* time spent producing this frame, without our sleep */
+                  if (work < target) {
+                      struct timespec ts;
+                      uint64_t sleep_ns = target - work;
+                      ts.tv_sec = (time_t)(sleep_ns / 1000000000ull);
+                      ts.tv_nsec = (long)(sleep_ns % 1000000000ull);
+                      nanosleep(&ts, NULL);
+                  }
+              }
+              g_fs.resume = now_ns();
+              return r;
+          }
+
+          static int hook_one(const char *name, PLFuncPtr detour, PLFuncPtr *orig) {
+              void *target = dlsym(RTLD_DEFAULT, name);
+              if (!target) {
+                  flog("res_scale: %s not found", name);
+                  return 0;
+              }
+              int r = g_pl_hook((PLFuncPtr)target, detour, orig, PL_HOOK_PRIORITY_NORMAL);
+              flog("res_scale: hook %s ret=%d orig=%p", name, r, *orig);
+              if (!*orig) *orig = (PLFuncPtr)target; /* never leave a NULL original */
+              return 1;
+          }
+
+          static int install_res_scaling(void) {
+          #define RESOLVE(var, name) do { *(void **)&(var) = dlsym(RTLD_DEFAULT, name); if (!(var)) { flog("res_scale: %s missing", name); return 0; } } while (0)
+              RESOLVE(p_glGenFramebuffers, "glGenFramebuffers");
+              RESOLVE(p_glGenRenderbuffers, "glGenRenderbuffers");
+              RESOLVE(p_glDeleteFramebuffers, "glDeleteFramebuffers");
+              RESOLVE(p_glDeleteRenderbuffers, "glDeleteRenderbuffers");
+              RESOLVE(p_glBindRenderbuffer, "glBindRenderbuffer");
+              RESOLVE(p_glRenderbufferStorage, "glRenderbufferStorage");
+              RESOLVE(p_glFramebufferRenderbuffer, "glFramebufferRenderbuffer");
+              RESOLVE(p_glCheckFramebufferStatus, "glCheckFramebufferStatus");
+              RESOLVE(p_glGetIntegerv, "glGetIntegerv");
+              RESOLVE(p_glIsEnabled, "glIsEnabled");
+              RESOLVE(p_glEnable, "glEnable");
+              RESOLVE(p_glDisable, "glDisable");
+              RESOLVE(p_eglQuerySurface, "eglQuerySurface");
+          #undef RESOLVE
+              if (!dlsym(RTLD_DEFAULT, "glBlitFramebuffer")) {
+                  flog("res_scale: glBlitFramebuffer missing (needs OpenGL ES 3.0)");
+                  return 0;
+              }
+              if (!hook_one("glBindFramebuffer", (PLFuncPtr)det_bindfb, (PLFuncPtr *)&orig_bindfb)) return 0;
+              if (!hook_one("glViewport", (PLFuncPtr)det_viewport, (PLFuncPtr *)&orig_viewport)) return 0;
+              if (!hook_one("glScissor", (PLFuncPtr)det_scissor, (PLFuncPtr *)&orig_scissor)) return 0;
+              if (!hook_one("glBlitFramebuffer", (PLFuncPtr)det_blit, (PLFuncPtr *)&orig_blit)) return 0;
+              return 1;
+          }
+
+          static void install_gl(void) {
+              pthread_mutex_lock(&g_lock);
+              if (g_gl_done) {
+                  pthread_mutex_unlock(&g_lock);
+                  return;
+              }
+              g_gl_done = 1;
+              ensure_config();
+              if (!g_vsync_off && g_fps_cap <= 0 && !g_fps_log && g_res_pct >= 100) {
+                  flog("GLES layer: all options off, not hooking eglSwapBuffers");
+                  pthread_mutex_unlock(&g_lock);
+                  return;
+              }
+              if (!g_pl_hook) resolve_preloader();
+              void *swap = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
+              p_swap_interval = (egl_interval_fn)dlsym(RTLD_DEFAULT, "eglSwapInterval");
+              if (!g_pl_hook || !swap) {
+                  flog("GLES layer: cannot hook (pl_hook=%p eglSwapBuffers=%p)", (void *)g_pl_hook, swap);
+                  pthread_mutex_unlock(&g_lock);
+                  return;
+              }
+              if (g_res_pct < 100) {
+                  if (install_res_scaling()) {
+                      g_res_state = RES_WAIT;
+                  } else {
+                      g_res_state = RES_FAILED;
+                      flog("res_scale: could not be installed, continuing without it");
+                  }
+              }
+              int r = g_pl_hook((PLFuncPtr)swap, (PLFuncPtr)det_swap, (PLFuncPtr *)&orig_swap, PL_HOOK_PRIORITY_NORMAL);
+              flog("GLES layer: hook eglSwapBuffers ret=%d orig=%p  vsync_off=%d fps_cap=%d fps_log=%d res_scale=%d", r,
+                   (void *)orig_swap, g_vsync_off, g_fps_cap, g_fps_log, g_res_pct);
+              pthread_mutex_unlock(&g_lock);
+          }
+
+          static void *wait_thread(void *arg) {
+              (void)arg;
+              for (int i = 0; i < 480; i++) { /* up to ~2 minutes */
+                  if (try_install()) return NULL;
+                  usleep(250000);
+              }
+              flog("game library never appeared, giving up");
+              return NULL;
+          }
+
+          static void start(void) {
+              install_gl();
+              if (try_install()) return;
+              pthread_t t;
+              if (pthread_create(&t, NULL, wait_thread, NULL) == 0) pthread_detach(t);
+          }
+
+          /* ------------------------------------------------------------------ launcher lifecycle */
+          EXPORT bool PLMod_Load(void) {
+              g_active = 1;
+              start();
+              return true;
+          }
+          EXPORT bool PLMod_Enable(void) {
+              g_active = 1;
+              start();
+              return true;
+          }
+          EXPORT bool PLMod_Disable(void) {
+              g_active = 0;
+              return true;
+          }
+          EXPORT bool PLMod_Unload(void) {
+              g_active = 0;
+              (void)g_pl_unhook;
+              return true;
+          }
+          /* legacy entry name some launcher builds look for */
+          EXPORT void LeviMod_Load(void) {
+              g_active = 1;
+              start();
+          }
+          FPSBOOST_EOF
+          cat > out/FpsBoost.cfg <<'CFG_EOF'
+          # FpsBoost 0.3 settings. Put this file in /sdcard/Download (or /sdcard) and restart the game.
+          # --- render passes: 1 = skip (disable) that pass, 0 = leave it alone
+          particles=1     # all particles (safe)
+          flipbook=0      # animated textures (water/lava/fire frames freeze)
+          celestial=0     # sun and moon
+          endsky=0        # End dimension sky
+          hand=0          # first-person hand / held item
+          entities=0      # batched entities: mobs become INVISIBLE (benchmark only!)
+          aimassist=0     # aim-assist highlight (harmless)
+          # --- GLES layer (works on any game build)
+          vsync_off=1     # 1 = turn VSync off so FPS no longer snaps to 30/60
+          fps_cap=0       # 0 = unlimited, or e.g. 60 to cap the frame rate (less heat)
+          fps_log=1       # write FPS + CPU/GPU hint to FpsBoost.log every 5 s
+          # --- EXPERIMENTAL render resolution scale (percent of screen size, 25-99; 100 = off)
+          # Lower = faster on a GPU-limited phone, blurrier picture. If the screen goes black or glitchy, set 100.
+          res_scale=100
+          res_filter=1    # 1 = smooth stretch, 0 = sharp pixels
+          CFG_EOF
+          wc -l mod/fpsboost.c
+
+      - name: Build libfpsboost.so (armeabi-v7a, Android NDK)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            NDK="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          echo "NDK: $NDK"
+          [ -d "$NDK" ] || { echo "Android NDK not found on this runner"; exit 1; }
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang"
+          "$CC" --version | head -n 1
+          "$CC" -shared -fPIC -O2 -Wall -Wextra -std=gnu11 -fvisibility=hidden \
+            -Wl,--build-id -Wl,-z,noexecstack \
+            -o out/libfpsboost.so mod/fpsboost.c -llog -ldl
+          ls -la out
+          file out/libfpsboost.so
+          readelf -h out/libfpsboost.so | grep -E "Class|Machine"
+          echo "--- needed libraries:"; readelf -d out/libfpsboost.so | grep NEEDED
+          echo "--- exported lifecycle symbols:"
+          readelf -W --dyn-syms out/libfpsboost.so | grep -E "PLMod_|LeviMod_"
+          readelf -W --dyn-syms out/libfpsboost.so | grep -q PLMod_Load || { echo "PLMod_Load not exported"; exit 1; }
+
+      - name: Upload mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: FpsBoost-armeabi-v7a
+          path: out
