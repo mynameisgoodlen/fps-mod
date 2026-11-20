@@ -19,7 +19,7 @@ jobs:
           mkdir -p mod out
           cat > mod/fpsboost.c <<'FPSBOOST_EOF'
           /*
-           * FpsBoost 0.3 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
+           * FpsBoost 0.4 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
            *
            * Skips selected RenderDragon frame-builder passes by hooking the tiny
            * FrameBuilder::insert<TDescription>() wrappers (found by reverse engineering).
@@ -33,8 +33,12 @@ jobs:
            * v0.2 added a GLES layer that does not depend on the game build: unlock VSync, optional frame cap,
            * and an FPS logger (average FPS + worst frame time every 5 s).
            * v0.3 adds (a) a CPU-vs-GPU hint in the FPS log (time spent waiting inside eglSwapBuffers) and
-           * (b) EXPERIMENTAL render-resolution scaling (res_scale=50..99): the game draws into a smaller
-           * off-screen buffer that is stretched to the screen once per frame.  Off by default.
+           * (b) render-resolution scaling: the game draws into an off-screen buffer that is stretched to the
+           * screen once per frame.
+           * v0.4 makes that scaling DYNAMIC (drs=1, target_fps=60): the buffer is allocated once at full size
+           * and only the viewport/scissor area changes per frame, lowering the resolution just enough to hold
+           * the target frame rate and raising it again when there is headroom.  If lowering the resolution does
+           * not speed things up (CPU-bound), it backs off.  Self-checks disable it if the game bypasses the hooks.
            *
            * Settings: optional text file  FpsBoost.cfg  (lines like  particles=1 ), looked up in
            *   /sdcard/Download, /storage/emulated/0/Download, /sdcard and the game's own files dir.
@@ -124,7 +128,14 @@ jobs:
           static int g_cfg_loaded;
 
           /* experimental resolution scaling */
-          static int g_res_pct = 100;     /* 100 = off */
+          static int g_res_pct = 100;     /* static scale / starting scale; 100 = none */
+          #ifndef FPSBOOST_DEFAULT_DRS
+          #define FPSBOOST_DEFAULT_DRS 1
+          #endif
+          static int g_drs = FPSBOOST_DEFAULT_DRS;   /* dynamic resolution scaling (the *_nodrs build defaults it to 0) */
+          static int g_target_fps = 60;
+          static int g_res_min = 50;      /* DRS floor in percent */
+          static double g_res_cur = 100.0;
           static int g_res_filter = 1;    /* 1 = linear, 0 = nearest */
           enum { RES_OFF = 0, RES_WAIT = 1, RES_READY = 2, RES_FAILED = 3 };
           static int g_res_state = RES_OFF;
@@ -244,6 +255,9 @@ jobs:
               if (strcmp(k, "fps_log") == 0) { g_fps_log = val ? 1 : 0; return; }
               if (strcmp(k, "res_scale") == 0) { g_res_pct = val < 25 ? 25 : (val > 100 ? 100 : val); return; }
               if (strcmp(k, "res_filter") == 0) { g_res_filter = val ? 1 : 0; return; }
+              if (strcmp(k, "drs") == 0) { g_drs = val ? 1 : 0; return; }
+              if (strcmp(k, "target_fps") == 0) { g_target_fps = val < 20 ? 20 : (val > 240 ? 240 : val); return; }
+              if (strcmp(k, "res_min") == 0) { g_res_min = val < 25 ? 25 : (val > 100 ? 100 : val); return; }
               for (int i = 0; i < H_COUNT; i++) {
                   if (strcmp(k, g_hooks[i].key) == 0) {
                       g_hooks[i].skip = val ? 1 : 0;
@@ -359,7 +373,7 @@ jobs:
                   return 0;
               }
               g_state = 1;
-              flog("FpsBoost 0.3: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
+              flog("FpsBoost 0.4: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
                    m.build_id[0] ? m.build_id : "(unreadable)");
               if (m.build_id[0] && strcmp(m.build_id, EXPECTED_BUILD_ID) != 0) {
                   flog("UNSUPPORTED game build (expected %s). Nothing was hooked.", EXPECTED_BUILD_ID);
@@ -414,7 +428,24 @@ jobs:
               if (*h > 0 && nh < 1) nh = 1;
               *x = x0; *y = y0; *w = nw; *h = nh;
           }
+          static int g_vp_req[4], g_sc_req[4];
+          static int g_vp_req_def, g_sc_req_def;      /* 1 = request made while the default framebuffer was bound */
+          static int g_frame_vp_hits, g_novp;         /* health check: does the game really go through our glViewport hook? */
+
           static int default_draw_virtual(void) { return g_res_state == RES_READY && g_game_draw == 0; }
+
+          static void res_apply_pct(void) {
+              double p = g_res_cur;
+              if (p < g_res_min) p = g_res_min;
+              if (p > 100.0) p = 100.0;
+              int vw = ((int)(g_sw * p / 100.0)) & ~1, vh = ((int)(g_sh * p / 100.0)) & ~1;
+              if (vw < 64) vw = 64;
+              if (vh < 64) vh = 64;
+              if (vw > g_sw) vw = g_sw;
+              if (vh > g_sh) vh = g_sh;
+              g_vw = vw;
+              g_vh = vh;
+          }
 
           static void det_bindfb(unsigned target, unsigned fb) {
               if (target == GLC_FRAMEBUFFER || target == GLC_DRAW_FRAMEBUFFER) g_game_draw = fb;
@@ -423,11 +454,18 @@ jobs:
               orig_bindfb(target, fb);
           }
           static void det_viewport(int x, int y, int w, int h) {
-              if (default_draw_virtual()) scale_rect(&x, &y, &w, &h);
+              g_vp_req[0] = x; g_vp_req[1] = y; g_vp_req[2] = w; g_vp_req[3] = h;
+              g_vp_req_def = default_draw_virtual();
+              if (g_vp_req_def) {
+                  g_frame_vp_hits++;
+                  scale_rect(&x, &y, &w, &h);
+              }
               orig_viewport(x, y, w, h);
           }
           static void det_scissor(int x, int y, int w, int h) {
-              if (default_draw_virtual()) scale_rect(&x, &y, &w, &h);
+              g_sc_req[0] = x; g_sc_req[1] = y; g_sc_req[2] = w; g_sc_req[3] = h;
+              g_sc_req_def = default_draw_virtual();
+              if (g_sc_req_def) scale_rect(&x, &y, &w, &h);
               orig_scissor(x, y, w, h);
           }
           static void det_blit(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1, unsigned mask, unsigned filter) {
@@ -449,11 +487,9 @@ jobs:
               g_vfbo = g_vcolor = g_vdepth = 0;
           }
 
-          /* create the small off-screen buffer; GL context must be current. returns 1 on success */
+          /* allocate the off-screen buffer at FULL size once (resizing GL buffers is expensive);
+           * only the used area changes later. GL context must be current. returns 1 on success */
           static int res_create(int sw, int sh) {
-              int vw = (sw * g_res_pct / 100) & ~1, vh = (sh * g_res_pct / 100) & ~1;
-              if (vw < 64) vw = 64;
-              if (vh < 64) vh = 64;
               int prev_draw = 0, prev_read = 0, prev_rb = 0;
               p_glGetIntegerv(GLC_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
               p_glGetIntegerv(GLC_READ_FRAMEBUFFER_BINDING, &prev_read);
@@ -462,9 +498,9 @@ jobs:
               p_glGenRenderbuffers(1, &g_vcolor);
               p_glGenRenderbuffers(1, &g_vdepth);
               p_glBindRenderbuffer(GLC_RENDERBUFFER, g_vcolor);
-              p_glRenderbufferStorage(GLC_RENDERBUFFER, GLC_RGBA8, vw, vh);
+              p_glRenderbufferStorage(GLC_RENDERBUFFER, GLC_RGBA8, sw, sh);
               p_glBindRenderbuffer(GLC_RENDERBUFFER, g_vdepth);
-              p_glRenderbufferStorage(GLC_RENDERBUFFER, GLC_DEPTH24_STENCIL8, vw, vh);
+              p_glRenderbufferStorage(GLC_RENDERBUFFER, GLC_DEPTH24_STENCIL8, sw, sh);
               orig_bindfb(GLC_FRAMEBUFFER, g_vfbo);
               p_glFramebufferRenderbuffer(GLC_FRAMEBUFFER, GLC_COLOR_ATTACHMENT0, GLC_RENDERBUFFER, g_vcolor);
               p_glFramebufferRenderbuffer(GLC_FRAMEBUFFER, GLC_DEPTH_STENCIL_ATTACHMENT, GLC_RENDERBUFFER, g_vdepth);
@@ -473,12 +509,14 @@ jobs:
               orig_bindfb(GLC_DRAW_FRAMEBUFFER, (unsigned)prev_draw);
               orig_bindfb(GLC_READ_FRAMEBUFFER, (unsigned)prev_read);
               if (st != GLC_FRAMEBUFFER_COMPLETE) {
-                  flog("res_scale: off-screen buffer %dx%d incomplete (0x%x) - scaling disabled", vw, vh, st);
+                  flog("res_scale: off-screen buffer %dx%d incomplete (0x%x) - scaling disabled", sw, sh, st);
                   res_destroy();
                   return 0;
               }
-              g_vw = vw; g_vh = vh; g_sw = sw; g_sh = sh;
-              flog("res_scale: rendering at %dx%d (%d%%) stretched to %dx%d", vw, vh, g_res_pct, sw, sh);
+              g_sw = sw;
+              g_sh = sh;
+              res_apply_pct();
+              flog("res_scale: buffer %dx%d allocated, drawing at %dx%d (%.0f%%)", sw, sh, g_vw, g_vh, g_res_cur);
               return 1;
           }
 
@@ -488,13 +526,22 @@ jobs:
               if (g_res_state == RES_OFF || g_res_state == RES_FAILED || !p_eglQuerySurface) return;
               if (!p_eglQuerySurface(dpy, surf, EGLC_WIDTH, &w) || !p_eglQuerySurface(dpy, surf, EGLC_HEIGHT, &h) || w <= 0 || h <= 0) return;
               if (g_res_state == RES_READY && w == g_sw && h == g_sh) {
-                  /* stretch the small buffer onto the real default framebuffer */
+                  /* health check: if the game never went through our glViewport hook this frame it drew at full size,
+                   * so copy the whole buffer 1:1 instead of the (smaller) scaled area */
+                  int hits = g_frame_vp_hits;
+                  g_frame_vp_hits = 0;
+                  int sx1 = hits ? g_vw : g_sw, sy1 = hits ? g_vh : g_sh;
+                  if (hits) g_novp = 0; else g_novp++;
                   unsigned char sc = p_glIsEnabled(GLC_SCISSOR_TEST);
                   if (sc) p_glDisable(GLC_SCISSOR_TEST);
                   orig_bindfb(GLC_READ_FRAMEBUFFER, g_vfbo);
                   orig_bindfb(GLC_DRAW_FRAMEBUFFER, 0);
-                  orig_blit(0, 0, g_vw, g_vh, 0, 0, g_sw, g_sh, GLC_COLOR_BUFFER_BIT, g_res_filter ? GLC_LINEAR : GLC_NEAREST);
+                  orig_blit(0, 0, sx1, sy1, 0, 0, g_sw, g_sh, GLC_COLOR_BUFFER_BIT, g_res_filter ? GLC_LINEAR : GLC_NEAREST);
                   if (sc) p_glEnable(GLC_SCISSOR_TEST);
+                  if (g_novp > 120) {
+                      g_res_state = RES_FAILED;
+                      flog("res_scale: the game does not use the hooked glViewport - scaling switched off");
+                  }
                   return;
               }
               /* first frame, or the surface size changed: (re)create, this frame is presented unscaled */
@@ -502,15 +549,87 @@ jobs:
                   g_res_state = RES_WAIT;
                   res_destroy();
               }
+              g_frame_vp_hits = 0;
+              g_novp = 0;
               if (res_create(w, h)) g_res_state = RES_READY;
               else g_res_state = RES_FAILED;
           }
 
-          /* after the real swap: put the bindings back the way the game expects them */
+          /* after the real swap: apply the new scale and put the bindings back the way the game expects them */
           static void res_post_swap(void) {
               if (g_res_state != RES_READY) return;
+              int old_vw = g_vw, old_vh = g_vh;
+              res_apply_pct();
               orig_bindfb(GLC_READ_FRAMEBUFFER, g_game_read ? g_game_read : g_vfbo);
               orig_bindfb(GLC_DRAW_FRAMEBUFFER, g_game_draw ? g_game_draw : g_vfbo);
+              if ((g_vw != old_vw || g_vh != old_vh) && g_game_draw == 0) {
+                  /* keep GL's current viewport/scissor consistent with the new factor until the game sets them again */
+                  if (g_vp_req_def) {
+                      int x = g_vp_req[0], y = g_vp_req[1], w = g_vp_req[2], h = g_vp_req[3];
+                      scale_rect(&x, &y, &w, &h);
+                      orig_viewport(x, y, w, h);
+                  }
+                  if (g_sc_req_def) {
+                      int x = g_sc_req[0], y = g_sc_req[1], w = g_sc_req[2], h = g_sc_req[3];
+                      scale_rect(&x, &y, &w, &h);
+                      orig_scissor(x, y, w, h);
+                  }
+              }
+          }
+
+          /* scaling was switched off after being active: hand the real bindings back to the game */
+          static void res_rebind_real(void) {
+              orig_bindfb(GLC_READ_FRAMEBUFFER, g_game_read);
+              orig_bindfb(GLC_DRAW_FRAMEBUFFER, g_game_draw);
+          }
+
+          /* ---- dynamic resolution controller (runs once per 20-frame window) */
+          static double drs_sqrt(double x) {
+              if (x <= 0.0) return 0.0;
+              double r = x > 1.0 ? x : 1.0;
+              for (int i = 0; i < 14; i++) r = 0.5 * (r + x / r);
+              return r;
+          }
+          static int g_drs_last_action;               /* -1 = the previous window lowered the scale */
+          static double g_drs_prev_pct, g_drs_last_interval;
+          static int g_drs_cooldown;
+          static unsigned g_win_frames;
+          static uint64_t g_win_interval, g_win_work;
+
+          static void drs_window(double interval_ms, double work_ms) {
+              double target = 1000.0 / (g_target_fps > 0 ? g_target_fps : 60);
+              int too_slow = interval_ms > target * 1.06;
+              int headroom = work_ms < target * 0.84;
+              if (g_drs_cooldown > 0) g_drs_cooldown--;
+              if (g_drs_last_action < 0) {
+                  g_drs_last_action = 0;
+                  if (too_slow && interval_ms > g_drs_last_interval * 0.97) {
+                      g_res_cur = g_drs_prev_pct;
+                      g_drs_cooldown = 40;
+                      flog("DRS: lowering the resolution did not speed things up (CPU-bound?) - back to %.0f%%, pausing", g_res_cur);
+                      return;
+                  }
+              }
+              if (g_drs_cooldown > 0) return;
+              if (too_slow) {
+                  if (g_res_cur > g_res_min) {
+                      double want = g_res_cur / drs_sqrt(interval_ms / target);   /* pixels ~ scale^2 */
+                      double step = (g_res_cur - want) * 0.8;
+                      if (step < 2.0) step = 2.0;
+                      if (step > 15.0) step = 15.0;
+                      double nxt = g_res_cur - step;
+                      if (nxt < g_res_min) nxt = g_res_min;
+                      if (nxt < g_res_cur) {
+                          g_drs_prev_pct = g_res_cur;
+                          g_drs_last_interval = interval_ms;
+                          g_drs_last_action = -1;
+                          g_res_cur = nxt;
+                      }
+                  }
+              } else if (headroom && g_res_cur < 100.0) {
+                  g_res_cur += 2.0;
+                  if (g_res_cur > 100.0) g_res_cur = 100.0;
+              }
           }
 
           static struct {
@@ -524,11 +643,13 @@ jobs:
           static unsigned int det_swap(void *dpy, void *surf) {
               unsigned long n = ++g_fs.total;
               if (g_vsync_off && p_swap_interval && (n == 1 || n % 90 == 0)) p_swap_interval(dpy, 0);
+              int was_ready = g_res_state == RES_READY;
               if (g_res_state != RES_OFF) res_pre_swap(dpy, surf);
               uint64_t ta = now_ns();
               unsigned int r = orig_swap ? orig_swap(dpy, surf) : 1u;
               uint64_t t = now_ns();
               if (g_res_state == RES_READY) res_post_swap();
+              else if (was_ready && g_res_state == RES_FAILED) res_rebind_real();
               if (!g_active) return r;
 
               if (g_fs.last) {
@@ -536,6 +657,14 @@ jobs:
                   if (d > g_fs.worst) g_fs.worst = d;
                   g_fs.swap_wait += t - ta;
                   g_fs.frames++;
+                  g_win_interval += d;
+                  g_win_work += t - g_fs.resume;
+                  if (++g_win_frames >= 20) {
+                      if (g_drs && g_res_state == RES_READY)
+                          drs_window((double)g_win_interval / 1e6 / g_win_frames, (double)g_win_work / 1e6 / g_win_frames);
+                      g_win_frames = 0;
+                      g_win_interval = g_win_work = 0;
+                  }
               } else {
                   g_fs.win_start = t;
                   g_fs.resume = t;
@@ -548,7 +677,7 @@ jobs:
                   const char *hint = wait_ms > frame_ms * 0.35 ? "GPU/compositor-bound likely" : "CPU/render-thread-bound likely";
                   flog("fps avg %.1f | frame %.1f ms = swap-wait %.1f + other %.1f | worst %.1f ms | %s | vsync_off=%d cap=%d res=%d%%",
                        g_fs.frames / secs, frame_ms, wait_ms, frame_ms - wait_ms, (double)g_fs.worst / 1e6, hint, g_vsync_off,
-                       g_fps_cap, g_res_pct);
+                       g_fps_cap, g_res_state == RES_READY ? (int)(g_res_cur + 0.5) : 100);
                   g_fs.win_start = t;
                   g_fs.frames = 0;
                   g_fs.worst = 0;
@@ -616,7 +745,8 @@ jobs:
               }
               g_gl_done = 1;
               ensure_config();
-              if (!g_vsync_off && g_fps_cap <= 0 && !g_fps_log && g_res_pct >= 100) {
+              int res_wanted = g_drs || g_res_pct < 100;
+              if (!g_vsync_off && g_fps_cap <= 0 && !g_fps_log && !res_wanted) {
                   flog("GLES layer: all options off, not hooking eglSwapBuffers");
                   pthread_mutex_unlock(&g_lock);
                   return;
@@ -629,7 +759,8 @@ jobs:
                   pthread_mutex_unlock(&g_lock);
                   return;
               }
-              if (g_res_pct < 100) {
+              if (res_wanted) {
+                  g_res_cur = g_res_pct < 100 ? (double)g_res_pct : (g_drs ? 85.0 : 100.0);
                   if (install_res_scaling()) {
                       g_res_state = RES_WAIT;
                   } else {
@@ -638,8 +769,8 @@ jobs:
                   }
               }
               int r = g_pl_hook((PLFuncPtr)swap, (PLFuncPtr)det_swap, (PLFuncPtr *)&orig_swap, PL_HOOK_PRIORITY_NORMAL);
-              flog("GLES layer: hook eglSwapBuffers ret=%d orig=%p  vsync_off=%d fps_cap=%d fps_log=%d res_scale=%d", r,
-                   (void *)orig_swap, g_vsync_off, g_fps_cap, g_fps_log, g_res_pct);
+              flog("GLES layer: hook eglSwapBuffers ret=%d orig=%p  vsync_off=%d fps_cap=%d fps_log=%d drs=%d target_fps=%d res_min=%d res_scale=%d",
+                   r, (void *)orig_swap, g_vsync_off, g_fps_cap, g_fps_log, g_drs, g_target_fps, g_res_min, g_res_pct);
               pthread_mutex_unlock(&g_lock);
           }
 
@@ -687,7 +818,7 @@ jobs:
           }
           FPSBOOST_EOF
           cat > out/FpsBoost.cfg <<'CFG_EOF'
-          # FpsBoost 0.3 settings. Put this file in /sdcard/Download (or /sdcard) and restart the game.
+          # FpsBoost 0.4 settings. Put this file in /sdcard/Download (or /sdcard) and restart the game.
           # --- render passes: 1 = skip (disable) that pass, 0 = leave it alone
           particles=1     # all particles (safe)
           flipbook=0      # animated textures (water/lava/fire frames freeze)
@@ -700,14 +831,16 @@ jobs:
           vsync_off=1     # 1 = turn VSync off so FPS no longer snaps to 30/60
           fps_cap=0       # 0 = unlimited, or e.g. 60 to cap the frame rate (less heat)
           fps_log=1       # write FPS + CPU/GPU hint to FpsBoost.log every 5 s
-          # --- EXPERIMENTAL render resolution scale (percent of screen size, 25-99; 100 = off)
-          # Lower = faster on a GPU-limited phone, blurrier picture. If the screen goes black or glitchy, set 100.
-          res_scale=100
+          # --- DYNAMIC RESOLUTION: lowers the render resolution just enough to hold target_fps, raises it when there is headroom
+          drs=1           # 1 = on, 0 = off.  If the screen is black/garbled set drs=0 (or use the _nodrs build)
+          target_fps=60   # frame rate to hold
+          res_min=50      # never go below this percent of the screen resolution (25-100)
           res_filter=1    # 1 = smooth stretch, 0 = sharp pixels
+          # res_scale=70  # optional: fixed scale (or starting scale) in percent; leave commented for automatic
           CFG_EOF
           wc -l mod/fpsboost.c
 
-      - name: Build libfpsboost.so (armeabi-v7a, Android NDK)
+      - name: Build libfpsboost.so and libfpsboost_nodrs.so (armeabi-v7a, Android NDK)
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
           if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
@@ -717,16 +850,19 @@ jobs:
           [ -d "$NDK" ] || { echo "Android NDK not found on this runner"; exit 1; }
           CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang"
           "$CC" --version | head -n 1
-          "$CC" -shared -fPIC -O2 -Wall -Wextra -std=gnu11 -fvisibility=hidden \
-            -Wl,--build-id -Wl,-z,noexecstack \
-            -o out/libfpsboost.so mod/fpsboost.c -llog -ldl
+          FLAGS="-shared -fPIC -O2 -Wall -Wextra -std=gnu11 -fvisibility=hidden -Wl,--build-id -Wl,-z,noexecstack"
+          "$CC" $FLAGS -o out/libfpsboost.so mod/fpsboost.c -llog -ldl
+          "$CC" $FLAGS -DFPSBOOST_DEFAULT_DRS=0 -o out/libfpsboost_nodrs.so mod/fpsboost.c -llog -ldl
           ls -la out
-          file out/libfpsboost.so
-          readelf -h out/libfpsboost.so | grep -E "Class|Machine"
-          echo "--- needed libraries:"; readelf -d out/libfpsboost.so | grep NEEDED
-          echo "--- exported lifecycle symbols:"
-          readelf -W --dyn-syms out/libfpsboost.so | grep -E "PLMod_|LeviMod_"
-          readelf -W --dyn-syms out/libfpsboost.so | grep -q PLMod_Load || { echo "PLMod_Load not exported"; exit 1; }
+          for f in out/libfpsboost.so out/libfpsboost_nodrs.so; do
+            echo "=== $f"
+            file "$f"
+            readelf -h "$f" | grep -E "Class|Machine"
+            echo "--- needed libraries:"; readelf -d "$f" | grep NEEDED
+            echo "--- exported lifecycle symbols:"
+            readelf -W --dyn-syms "$f" | grep -E "PLMod_|LeviMod_"
+            readelf -W --dyn-syms "$f" | grep -q PLMod_Load || { echo "PLMod_Load not exported"; exit 1; }
+          done
 
       - name: Upload mod
         uses: actions/upload-artifact@v4
