@@ -19,7 +19,7 @@ jobs:
           mkdir -p mod out
           cat > mod/fpsboost.c <<'FPSBOOST_EOF'
           /*
-           * FpsBoost 0.5 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
+           * FpsBoost 0.6 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
            *
            * Skips selected RenderDragon frame-builder passes by hooking the tiny
            * FrameBuilder::insert<TDescription>() wrappers (found by reverse engineering).
@@ -40,6 +40,10 @@ jobs:
            * the target frame rate and raising it again when there is headroom.  If lowering the resolution does
            * not speed things up (CPU-bound), it backs off.  Self-checks disable it if the game bypasses the hooks.
            *
+           * v0.6: finds the game's options.txt and copies it (plus its gfx_ keys) into the log folders so the real option
+           * names for this build are known.  Fixes the EGL/GLES symbol lookup.  dlsym(RTLD_DEFAULT) cannot see libEGL/libGLES inside the launcher's
+           * linker namespace (v0.2-v0.5 never hooked eglSwapBuffers), so they are now looked up through explicit
+           * dlopen() handles.
            * v0.5: the launcher only holds READ_EXTERNAL_STORAGE, so it cannot write to Download.  Logs now go to
            * the launcher's own folders and a per-thread CPU profiler + CPU frequency/temperature snapshot was added.
            *
@@ -125,6 +129,7 @@ jobs:
           static pl_hook_fn g_pl_hook;
           static pl_unhook_fn g_pl_unhook;
           static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+          static void dump_options(void);
           static char g_pkg[128];
 
           /* GLES layer settings (config keys: vsync_off, fps_cap, fps_log) */
@@ -405,7 +410,7 @@ jobs:
                   return 0;
               }
               g_state = 1;
-              flog("FpsBoost 0.5: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
+              flog("FpsBoost 0.6: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
                    m.build_id[0] ? m.build_id : "(unreadable)");
               if (m.build_id[0] && strcmp(m.build_id, EXPECTED_BUILD_ID) != 0) {
                   flog("UNSUPPORTED game build (expected %s). Nothing was hooked.", EXPECTED_BUILD_ID);
@@ -437,6 +442,7 @@ jobs:
               }
               flog("done: %d of %d requested hooks installed", ok, want);
               pthread_mutex_unlock(&g_lock);
+              dump_options();
               return 1;
           }
 
@@ -858,8 +864,26 @@ jobs:
               return r;
           }
 
+          /* EGL/GLES symbols: dlsym(RTLD_DEFAULT) does not see these inside the launcher's linker namespace
+           * (it returned NULL for eglSwapBuffers), so look them up through explicit handles of the system libraries. */
+          static void *g_lib_egl, *g_lib_gles3, *g_lib_gles2;
+          static void *gl_sym(const char *name) {
+              void *p = dlsym(RTLD_DEFAULT, name);
+              if (p) return p;
+              if (!g_lib_egl) g_lib_egl = dlopen("libEGL.so", RTLD_NOW);
+              if (!g_lib_gles3) g_lib_gles3 = dlopen("libGLESv3.so", RTLD_NOW);
+              if (!g_lib_gles2) g_lib_gles2 = dlopen("libGLESv2.so", RTLD_NOW);
+              void *handles[3] = {g_lib_egl, g_lib_gles3, g_lib_gles2};
+              for (int i = 0; i < 3; i++) {
+                  if (!handles[i]) continue;
+                  p = dlsym(handles[i], name);
+                  if (p) return p;
+              }
+              return NULL;
+          }
+
           static int hook_one(const char *name, PLFuncPtr detour, PLFuncPtr *orig) {
-              void *target = dlsym(RTLD_DEFAULT, name);
+              void *target = gl_sym(name);
               if (!target) {
                   flog("res_scale: %s not found", name);
                   return 0;
@@ -871,7 +895,7 @@ jobs:
           }
 
           static int install_res_scaling(void) {
-          #define RESOLVE(var, name) do { *(void **)&(var) = dlsym(RTLD_DEFAULT, name); if (!(var)) { flog("res_scale: %s missing", name); return 0; } } while (0)
+          #define RESOLVE(var, name) do { *(void **)&(var) = gl_sym(name); if (!(var)) { flog("res_scale: %s missing", name); return 0; } } while (0)
               RESOLVE(p_glGenFramebuffers, "glGenFramebuffers");
               RESOLVE(p_glGenRenderbuffers, "glGenRenderbuffers");
               RESOLVE(p_glDeleteFramebuffers, "glDeleteFramebuffers");
@@ -886,7 +910,7 @@ jobs:
               RESOLVE(p_glDisable, "glDisable");
               RESOLVE(p_eglQuerySurface, "eglQuerySurface");
           #undef RESOLVE
-              if (!dlsym(RTLD_DEFAULT, "glBlitFramebuffer")) {
+              if (!gl_sym("glBlitFramebuffer")) {
                   flog("res_scale: glBlitFramebuffer missing (needs OpenGL ES 3.0)");
                   return 0;
               }
@@ -912,10 +936,11 @@ jobs:
                   return;
               }
               if (!g_pl_hook) resolve_preloader();
-              void *swap = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
-              p_swap_interval = (egl_interval_fn)dlsym(RTLD_DEFAULT, "eglSwapInterval");
+              void *swap = gl_sym("eglSwapBuffers");
+              p_swap_interval = (egl_interval_fn)gl_sym("eglSwapInterval");
               if (!g_pl_hook || !swap) {
-                  flog("GLES layer: cannot hook (pl_hook=%p eglSwapBuffers=%p)", (void *)g_pl_hook, swap);
+                  flog("GLES layer: cannot hook (pl_hook=%p eglSwapBuffers=%p libEGL=%p libGLESv3=%p libGLESv2=%p)", (void *)g_pl_hook, swap,
+                       g_lib_egl, g_lib_gles3, g_lib_gles2);
                   pthread_mutex_unlock(&g_lock);
                   return;
               }
@@ -932,6 +957,95 @@ jobs:
               flog("GLES layer: hook eglSwapBuffers ret=%d orig=%p  vsync_off=%d fps_cap=%d fps_log=%d drs=%d target_fps=%d res_min=%d res_scale=%d",
                    r, (void *)orig_swap, g_vsync_off, g_fps_cap, g_fps_log, g_drs, g_target_fps, g_res_min, g_res_pct);
               pthread_mutex_unlock(&g_lock);
+          }
+
+
+          /* ------------------------------------------------------------------ options.txt discovery (diagnostic) */
+          /* depth-limited search for a file called `name` under `root`; returns 1 and fills `out` when found */
+          static int find_file(const char *root, const char *name, int depth, char *out, size_t outsz) {
+              DIR *d = opendir(root);
+              if (!d) return 0;
+              struct dirent *e;
+              int found = 0;
+              while (!found && (e = readdir(d)) != NULL) {
+                  if (e->d_name[0] == '.') continue;
+                  char path[DIRLEN * 2];
+                  snprintf(path, sizeof(path), "%s/%s", root, e->d_name);
+                  if (strcmp(e->d_name, name) == 0) {
+                      struct stat st;
+                      if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+                          snprintf(out, outsz, "%s", path);
+                          found = 1;
+                          break;
+                      }
+                  }
+                  if (depth > 0) {
+                      struct stat st;
+                      if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) found = find_file(path, name, depth - 1, out, outsz);
+                  }
+              }
+              closedir(d);
+              return found;
+          }
+
+          static void write_everywhere(const char *fname, const char *data, size_t len) {
+              char dirs[MAX_DIRS][DIRLEN];
+              int nd = build_dirs(dirs);
+              for (int i = 0; i < nd; i++) {
+                  char path[DIRLEN + 64];
+                  snprintf(path, sizeof(path), "%s/%s", dirs[i], fname);
+                  FILE *f = fopen(path, "w");
+                  if (!f && strncmp(dirs[i], "/sdcard/Android/media/", 22) == 0) {
+                      mkdir("/sdcard/Android/media", 0777);
+                      mkdir(dirs[i], 0777);
+                      f = fopen(path, "w");
+                  }
+                  if (!f) continue;
+                  fwrite(data, 1, len, f);
+                  fclose(f);
+              }
+          }
+
+          static void dump_options(void) {
+              load_pkg();
+              char path[DIRLEN * 2] = "";
+              const char *roots[] = {"/sdcard/Android/data", "/data/data", "/data/user/0", "/sdcard/games", NULL};
+              for (int i = 0; roots[i] && !path[0]; i++) {
+                  char root[DIRLEN];
+                  if (i == 3) snprintf(root, sizeof(root), "%s", roots[i]);
+                  else snprintf(root, sizeof(root), "%s/%s", roots[i], g_pkg);
+                  find_file(root, "options.txt", 6, path, sizeof(path));
+              }
+              if (!path[0]) {
+                  flog("options.txt: not found under Android/data, /data/data or /sdcard/games");
+                  return;
+              }
+              FILE *f = fopen(path, "r");
+              if (!f) {
+                  flog("options.txt: found at %s but cannot be opened", path);
+                  return;
+              }
+              static char buf[16384];
+              size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+              fclose(f);
+              buf[n] = 0;
+              flog("options.txt: %s (%zu bytes read) - full copy saved as options_dump.txt", path, n);
+              write_everywhere("options_dump.txt", buf, n);
+              /* also put the graphics keys straight into the log */
+              char *line = buf;
+              int shown = 0;
+              while (line && *line && shown < 60) {
+                  char *nl = strchr(line, '\n');
+                  if (nl) *nl = 0;
+                  if (strncmp(line, "gfx_", 4) == 0 || strstr(line, "viewdistance") || strstr(line, "simulation") || strstr(line, "upscal") ||
+                      strstr(line, "resolution") || strstr(line, "framerate") || strstr(line, "vsync")) {
+                      size_t ll = strlen(line);
+                      if (ll && line[ll - 1] == '\r') line[ll - 1] = 0;
+                      flog("option: %s", line);
+                      shown++;
+                  }
+                  line = nl ? nl + 1 : NULL;
+              }
           }
 
           static void *wait_thread(void *arg) {
@@ -980,26 +1094,22 @@ jobs:
           }
           FPSBOOST_EOF
           cat > out/FpsBoost.cfg <<'CFG_EOF'
-          # FpsBoost 0.5 settings (optional - the mod works without this file).
+          # FpsBoost 0.6 settings (optional - the mod works without this file).
           # Place it in /sdcard/Android/media/org.levimc.launcher/ or /sdcard/Android/data/org.levimc.launcher/files/
-          # --- render passes: 1 = skip (disable) that pass, 0 = leave it alone
-          particles=1     # all particles (safe)
-          flipbook=0      # animated textures (water/lava/fire frames freeze)
+          particles=1     # 1 = skip all particles
+          flipbook=0      # animated textures
           celestial=0     # sun and moon
           endsky=0        # End dimension sky
-          hand=0          # first-person hand / held item
+          hand=0          # held item in first person
           entities=0      # batched entities: mobs become INVISIBLE (benchmark only!)
-          aimassist=0     # aim-assist highlight (harmless)
-          # --- GLES layer (works on any game build)
-          vsync_off=1     # 1 = turn VSync off so FPS no longer snaps to 30/60
-          fps_cap=0       # 0 = unlimited, or e.g. 60 to cap the frame rate (less heat)
-          fps_log=1       # write FPS, per-thread CPU use and CPU speed/temperature to FpsBoost.log every 5 s
-          # --- dynamic resolution (off in the normal build; on in libfpsboost_drs.so)
-          drs=0
+          aimassist=0     # aim-assist highlight
+          vsync_off=1     # turn VSync off
+          fps_cap=0       # 0 = unlimited
+          fps_log=1       # FPS + per-thread CPU + CPU speed/temperature in FpsBoost.log every 5 s
+          drs=0           # dynamic resolution (the _drs build turns it on)
           target_fps=60
           res_min=50
           res_filter=1
-          # res_scale=70  # optional fixed scale in percent
           CFG_EOF
           wc -l mod/fpsboost.c
 
