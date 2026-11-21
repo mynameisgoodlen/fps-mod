@@ -19,7 +19,7 @@ jobs:
           mkdir -p mod out
           cat > mod/fpsboost.c <<'FPSBOOST_EOF'
           /*
-           * FpsBoost 0.4 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
+           * FpsBoost 0.5 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
            *
            * Skips selected RenderDragon frame-builder passes by hooking the tiny
            * FrameBuilder::insert<TDescription>() wrappers (found by reverse engineering).
@@ -40,13 +40,18 @@ jobs:
            * the target frame rate and raising it again when there is headroom.  If lowering the resolution does
            * not speed things up (CPU-bound), it backs off.  Self-checks disable it if the game bypasses the hooks.
            *
-           * Settings: optional text file  FpsBoost.cfg  (lines like  particles=1 ), looked up in
-           *   /sdcard/Download, /storage/emulated/0/Download, /sdcard and the game's own files dir.
+           * v0.5: the launcher only holds READ_EXTERNAL_STORAGE, so it cannot write to Download.  Logs now go to
+           * the launcher's own folders and a per-thread CPU profiler + CPU frequency/temperature snapshot was added.
+           *
+           * Settings: optional text file  FpsBoost.cfg  (lines like  particles=1 ), looked up in the launcher's own
+           *   folders (Android/data/<pkg>/files, Android/media/<pkg>) and, if readable, /sdcard/Download and /sdcard.
            *   1 = skip (disable) that pass, 0 = leave it alone.
-           * Log: FpsBoost.log in the same places (first writable one) and logcat tag "FpsBoost".
+           * Log: FpsBoost.log in every one of those places that is writable, and logcat tag "FpsBoost".
            */
           #define _GNU_SOURCE
           #include <android/log.h>
+          #include <dirent.h>
+          #include <sys/stat.h>
           #include <dlfcn.h>
           #include <link.h>
           #include <pthread.h>
@@ -76,6 +81,13 @@ jobs:
 
           typedef void (*wrapper_fn)(void *self, const void *desc);
 
+          /* proof-of-life build (-DFPSBOOST_PROOF=1): also hides the first-person hand and the sun/moon so the effect is visible */
+          #ifdef FPSBOOST_PROOF
+          #define PROOF_SKIP 1
+          #else
+          #define PROOF_SKIP 0
+          #endif
+
           typedef struct {
               const char *key;      /* config key */
               const char *what;     /* description for the log */
@@ -101,9 +113,9 @@ jobs:
           static Hook g_hooks[H_COUNT] = {
               [H_PARTICLES] = {"particles", "RenderParticleDescription (particles)", 0x06e57b44, 1, (PLFuncPtr)det_particles, &orig_particles, 0, 0},
               [H_FLIPBOOK]  = {"flipbook", "BlitFlipbookTextureDescription (animated textures)", 0x073dff04, 0, (PLFuncPtr)det_flipbook, &orig_flipbook, 0, 0},
-              [H_CELESTIAL] = {"celestial", "RenderCelestialBodyDescription (sun/moon)", 0x073bbad8, 0, (PLFuncPtr)det_celestial, &orig_celestial, 0, 0},
+              [H_CELESTIAL] = {"celestial", "RenderCelestialBodyDescription (sun/moon)", 0x073bbad8, PROOF_SKIP, (PLFuncPtr)det_celestial, &orig_celestial, 0, 0},
               [H_ENDSKY]    = {"endsky", "RenderEndSkyDescription (End sky)", 0x073bb8a0, 0, (PLFuncPtr)det_endsky, &orig_endsky, 0, 0},
-              [H_HAND]      = {"hand", "RenderItemInHandDescription (first-person hand/item)", 0x07404390, 0, (PLFuncPtr)det_hand, &orig_hand, 0, 0},
+              [H_HAND]      = {"hand", "RenderItemInHandDescription (first-person hand/item)", 0x07404390, PROOF_SKIP, (PLFuncPtr)det_hand, &orig_hand, 0, 0},
               [H_ENTITIES]  = {"entities", "RenderBatchActorDescription (batched entities - they become invisible!)", 0x06a490ec, 0, (PLFuncPtr)det_entities, &orig_entities, 0, 0},
               [H_AIMASSIST] = {"aimassist", "RenderCameraAimAssistHighlightDescription", 0x073bbccc, 0, (PLFuncPtr)det_aimassist, &orig_aimassist, 0, 0},
           };
@@ -130,9 +142,9 @@ jobs:
           /* experimental resolution scaling */
           static int g_res_pct = 100;     /* static scale / starting scale; 100 = none */
           #ifndef FPSBOOST_DEFAULT_DRS
-          #define FPSBOOST_DEFAULT_DRS 1
+          #define FPSBOOST_DEFAULT_DRS 0
           #endif
-          static int g_drs = FPSBOOST_DEFAULT_DRS;   /* dynamic resolution scaling (the *_nodrs build defaults it to 0) */
+          static int g_drs = FPSBOOST_DEFAULT_DRS;   /* dynamic resolution scaling: off by default, build with -DFPSBOOST_DEFAULT_DRS=1 */
           static int g_target_fps = 60;
           static int g_res_min = 50;      /* DRS floor in percent */
           static double g_res_cur = 100.0;
@@ -181,40 +193,63 @@ jobs:
           #define EGLC_WIDTH 0x3057
 
           /* ------------------------------------------------------------------ logging */
-          static const char *LOG_DIRS[] = {"/sdcard/Download", "/storage/emulated/0/Download", "/sdcard", NULL};
+          #define MAX_DIRS 6
+          #define DIRLEN 300
+
+          /* "org.levimc.launcher:game" -> "org.levimc.launcher"; empty -> the launcher's package name */
+          static void sanitize_pkg(char *pkg, size_t sz) {
+              char *colon = strchr(pkg, ':');
+              if (colon) *colon = 0;
+              if (!pkg[0]) snprintf(pkg, sz, "org.levimc.launcher");
+          }
 
           static void load_pkg(void) {
               if (g_pkg[0]) return;
               FILE *f = fopen("/proc/self/cmdline", "r");
-              if (!f) return;
-              size_t n = fread(g_pkg, 1, sizeof(g_pkg) - 1, f);
-              g_pkg[n] = 0;
-              fclose(f);
+              if (f) {
+                  size_t n = fread(g_pkg, 1, sizeof(g_pkg) - 1, f);
+                  g_pkg[n] = 0;
+                  fclose(f);
+              }
+              sanitize_pkg(g_pkg, sizeof(g_pkg));
+          }
+
+          /* folders to log into / read the config from, most reliable first */
+          static int build_dirs(char dirs[MAX_DIRS][DIRLEN]) {
+              load_pkg();
+              int n = 0;
+              snprintf(dirs[n++], DIRLEN, "/sdcard/Android/data/%s/files", g_pkg);   /* always writable by the app itself */
+              snprintf(dirs[n++], DIRLEN, "/sdcard/Android/media/%s", g_pkg);        /* readable from file managers / Termux */
+              if (strcmp(g_pkg, "org.levimc.launcher") != 0)                         /* odd process name: still try the launcher's own folder */
+                  snprintf(dirs[n++], DIRLEN, "/sdcard/Android/data/org.levimc.launcher/files");
+              snprintf(dirs[n++], DIRLEN, "/sdcard/Download");                       /* only if the app has write access */
+              snprintf(dirs[n++], DIRLEN, "/sdcard");
+              return n;
           }
 
           static void flog(const char *fmt, ...) {
-              char msg[600];
+              char msg[800];
               va_list ap;
               va_start(ap, fmt);
               vsnprintf(msg, sizeof(msg), fmt, ap);
               va_end(ap);
               __android_log_write(ANDROID_LOG_INFO, TAG, msg);
 
-              load_pkg();
-              char path[300];
-              FILE *f = NULL;
-              for (int i = 0; LOG_DIRS[i] && !f; i++) {
-                  snprintf(path, sizeof(path), "%s/FpsBoost.log", LOG_DIRS[i]);
-                  f = fopen(path, "a");
-              }
-              if (!f && g_pkg[0]) {
-                  snprintf(path, sizeof(path), "/sdcard/Android/data/%s/files/FpsBoost.log", g_pkg);
-                  f = fopen(path, "a");
-              }
-              if (f) {
-                  time_t t = time(NULL);
-                  struct tm tmv;
-                  localtime_r(&t, &tmv);
+              char dirs[MAX_DIRS][DIRLEN];
+              int nd = build_dirs(dirs);
+              time_t t = time(NULL);
+              struct tm tmv;
+              localtime_r(&t, &tmv);
+              for (int i = 0; i < nd; i++) {
+                  char path[DIRLEN + 20];
+                  snprintf(path, sizeof(path), "%s/FpsBoost.log", dirs[i]);
+                  FILE *f = fopen(path, "a");
+                  if (!f && strncmp(dirs[i], "/sdcard/Android/media/", 22) == 0) {   /* an app may create its own media folder */
+                      mkdir("/sdcard/Android/media", 0777);
+                      mkdir(dirs[i], 0777);
+                      f = fopen(path, "a");
+                  }
+                  if (!f) continue;
                   fprintf(f, "[%02d:%02d:%02d] %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, msg);
                   fclose(f);
               }
@@ -267,19 +302,16 @@ jobs:
           }
 
           static void load_config(void) {
-              load_pkg();
-              char path[300];
+              char dirs[MAX_DIRS][DIRLEN];
+              int nd = build_dirs(dirs);
+              char path[DIRLEN + 20];
               FILE *f = NULL;
-              for (int i = 0; LOG_DIRS[i] && !f; i++) {
-                  snprintf(path, sizeof(path), "%s/FpsBoost.cfg", LOG_DIRS[i]);
-                  f = fopen(path, "r");
-              }
-              if (!f && g_pkg[0]) {
-                  snprintf(path, sizeof(path), "/sdcard/Android/data/%s/files/FpsBoost.cfg", g_pkg);
+              for (int i = 0; i < nd && !f; i++) {
+                  snprintf(path, sizeof(path), "%s/FpsBoost.cfg", dirs[i]);
                   f = fopen(path, "r");
               }
               if (!f) {
-                  flog("no FpsBoost.cfg found, using defaults (particles=1, vsync_off=1, fps_log=1, everything else 0)");
+                  flog("no FpsBoost.cfg found (looked in %s, %s, ...) - using built-in defaults", dirs[0], dirs[1]);
                   return;
               }
               flog("config: %s", path);
@@ -373,7 +405,7 @@ jobs:
                   return 0;
               }
               g_state = 1;
-              flog("FpsBoost 0.4: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
+              flog("FpsBoost 0.5: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
                    m.build_id[0] ? m.build_id : "(unreadable)");
               if (m.build_id[0] && strcmp(m.build_id, EXPECTED_BUILD_ID) != 0) {
                   flog("UNSUPPORTED game build (expected %s). Nothing was hooked.", EXPECTED_BUILD_ID);
@@ -410,10 +442,125 @@ jobs:
 
 
           /* ------------------------------------------------------------------ GLES layer (build independent) */
+
+          /* ------------------------------------------------------------------ diagnostics */
           static uint64_t now_ns(void) {
               struct timespec ts;
               clock_gettime(CLOCK_MONOTONIC, &ts);
               return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+          }
+          static uint64_t cpu_ns(clockid_t id) {
+              struct timespec ts;
+              if (clock_gettime(id, &ts) != 0) return 0;
+              return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+          }
+
+          /* parse one /proc/<pid>/task/<tid>/stat line: command name and utime+stime in clock ticks */
+          static int parse_stat(const char *line, char *comm, size_t csz, unsigned long *ticks) {
+              const char *lp = strchr(line, '(');
+              const char *rp = strrchr(line, ')');
+              if (!lp || !rp || rp < lp) return 0;
+              size_t n = (size_t)(rp - lp - 1);
+              if (n >= csz) n = csz - 1;
+              memcpy(comm, lp + 1, n);
+              comm[n] = 0;
+              unsigned long ut = 0, st = 0;
+              if (sscanf(rp + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st) != 2) return 0;
+              *ticks = ut + st;
+              return 1;
+          }
+
+          #define MAXTH 256
+          typedef struct { int tid; unsigned long ticks; char name[20]; } ThSample;
+          static ThSample g_th_prev[MAXTH];
+          static int g_th_prev_n;
+
+          /* log the busiest threads of this process (percent of ONE core over the last window) */
+          static void thread_report(double wall_s) {
+              DIR *d = opendir("/proc/self/task");
+              if (!d) return;
+              ThSample cur[MAXTH];
+              int n = 0;
+              struct dirent *e;
+              while ((e = readdir(d)) != NULL && n < MAXTH) {
+                  int tid = atoi(e->d_name);
+                  if (tid <= 0) continue;
+                  char path[64], line[512];
+                  snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+                  FILE *f = fopen(path, "r");
+                  if (!f) continue;
+                  if (fgets(line, sizeof(line), f) && parse_stat(line, cur[n].name, sizeof(cur[n].name), &cur[n].ticks)) {
+                      cur[n].tid = tid;
+                      n++;
+                  }
+                  fclose(f);
+              }
+              closedir(d);
+              double pct[MAXTH];
+              for (int i = 0; i < n; i++) {
+                  unsigned long before = 0;
+                  for (int j = 0; j < g_th_prev_n; j++)
+                      if (g_th_prev[j].tid == cur[i].tid) { before = g_th_prev[j].ticks; break; }
+                  pct[i] = (cur[i].ticks >= before && g_th_prev_n) ? (double)(cur[i].ticks - before) / 100.0 / wall_s * 100.0 : 0.0;
+              }
+              char buf[500];
+              int len = snprintf(buf, sizeof(buf), "threads(%d, %% of one core):", n);
+              for (int k = 0; k < 6; k++) {
+                  int best = -1;
+                  for (int i = 0; i < n; i++) if (pct[i] >= 0 && (best < 0 || pct[i] > pct[best])) best = i;
+                  if (best < 0 || pct[best] < 3.0) break;
+                  len += snprintf(buf + len, sizeof(buf) - (size_t)len, " %s/%d=%.0f", cur[best].name, cur[best].tid, pct[best]);
+                  pct[best] = -1;
+              }
+              flog("%s", buf);
+              memcpy(g_th_prev, cur, sizeof(ThSample) * (size_t)n);
+              g_th_prev_n = n;
+          }
+
+          static long read_long_file(const char *path) {
+              FILE *f = fopen(path, "r");
+              if (!f) return -1;
+              long v = -1;
+              if (fscanf(f, "%ld", &v) != 1) v = -1;
+              fclose(f);
+              return v;
+          }
+
+          /* CPU frequencies and temperatures: throttling is the usual reason a phone sags from 40 to 30 fps */
+          static void sys_snapshot(void) {
+              char buf[700];
+              int len = snprintf(buf, sizeof(buf), "sys: cpu MHz(cur):");
+              long maxf = read_long_file("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq");
+              int cores = (int)sysconf(_SC_NPROCESSORS_CONF);
+              if (cores > 16) cores = 16;
+              for (int i = 0; i < cores; i++) {
+                  char p[100];
+                  snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", i);
+                  long v = read_long_file(p);
+                  if (v < 0) len += snprintf(buf + len, sizeof(buf) - (size_t)len, " off/n.a.");
+                  else len += snprintf(buf + len, sizeof(buf) - (size_t)len, " %ld", v / 1000);
+              }
+              if (maxf > 0) len += snprintf(buf + len, sizeof(buf) - (size_t)len, " (cpu0 max %ld)", maxf / 1000);
+              len += snprintf(buf + len, sizeof(buf) - (size_t)len, " | temps:");
+              int shown = 0;
+              for (int z = 0; z < 24 && shown < 6; z++) {
+                  char p[100], type[40] = "zone";
+                  snprintf(p, sizeof(p), "/sys/class/thermal/thermal_zone%d/temp", z);
+                  long t = read_long_file(p);
+                  if (t <= 0) continue;
+                  double c = t > 1000 ? t / 1000.0 : (double)t;
+                  if (c < 5.0 || c > 150.0) continue;
+                  snprintf(p, sizeof(p), "/sys/class/thermal/thermal_zone%d/type", z);
+                  FILE *f = fopen(p, "r");
+                  if (f) {
+                      if (fgets(type, sizeof(type), f)) type[strcspn(type, "\r\n")] = 0;
+                      fclose(f);
+                  }
+                  len += snprintf(buf + len, sizeof(buf) - (size_t)len, " %s=%.0fC", type, c);
+                  shown++;
+              }
+              if (!shown) len += snprintf(buf + len, sizeof(buf) - (size_t)len, " n.a.");
+              flog("%s", buf);
           }
 
           /* ---- resolution scaling: coordinate helpers (pure, unit-tested) */
@@ -636,6 +783,7 @@ jobs:
               uint64_t last;      /* time of the previous swap (for FPS statistics) */
               uint64_t resume;    /* time the previous frame finished, after any cap sleep (for the cap) */
               uint64_t win_start, worst, swap_wait;
+              uint64_t thr_prev, thr_acc, proc_win_start;   /* render-thread CPU time and whole-process CPU time */
               unsigned frames;
               unsigned long total;
           } g_fs;
@@ -652,7 +800,9 @@ jobs:
               else if (was_ready && g_res_state == RES_FAILED) res_rebind_real();
               if (!g_active) return r;
 
+              uint64_t thr_now = cpu_ns(CLOCK_THREAD_CPUTIME_ID);
               if (g_fs.last) {
+                  g_fs.thr_acc += thr_now - g_fs.thr_prev;
                   uint64_t d = t - g_fs.last;              /* full swap-to-swap interval */
                   if (d > g_fs.worst) g_fs.worst = d;
                   g_fs.swap_wait += t - ta;
@@ -668,16 +818,26 @@ jobs:
               } else {
                   g_fs.win_start = t;
                   g_fs.resume = t;
+                  g_fs.proc_win_start = cpu_ns(CLOCK_PROCESS_CPUTIME_ID);
               }
+              g_fs.thr_prev = thr_now;
               g_fs.last = t;
               if (g_fps_log && g_fs.frames && t - g_fs.win_start >= (uint64_t)g_log_interval_ms * 1000000ull) {
                   double secs = (double)(t - g_fs.win_start) / 1e9;
                   double frame_ms = secs * 1000.0 / g_fs.frames;
                   double wait_ms = (double)g_fs.swap_wait / 1e6 / g_fs.frames;
-                  const char *hint = wait_ms > frame_ms * 0.35 ? "GPU/compositor-bound likely" : "CPU/render-thread-bound likely";
-                  flog("fps avg %.1f | frame %.1f ms = swap-wait %.1f + other %.1f | worst %.1f ms | %s | vsync_off=%d cap=%d res=%d%%",
-                       g_fs.frames / secs, frame_ms, wait_ms, frame_ms - wait_ms, (double)g_fs.worst / 1e6, hint, g_vsync_off,
-                       g_fps_cap, g_res_state == RES_READY ? (int)(g_res_cur + 0.5) : 100);
+                  double busy = (double)g_fs.thr_acc / 1e9 / secs;                       /* this thread's CPU use, 1.0 = one full core */
+                  uint64_t pnow = cpu_ns(CLOCK_PROCESS_CPUTIME_ID);
+                  double cores_used = (double)(pnow - g_fs.proc_win_start) / 1e9 / secs;   /* whole process, in cores */
+                  const char *hint = busy > 0.85 ? "render thread is CPU-saturated" :
+                                     wait_ms > frame_ms * 0.35 ? "GPU/compositor-bound likely" : "waiting on other threads/vsync";
+                  flog("fps avg %.1f | frame %.1f ms = swap-wait %.1f + other %.1f | worst %.1f ms | render-thread busy %.0f%% | process %.1f cores | %s | vsync_off=%d cap=%d drs=%d res=%d%%",
+                       g_fs.frames / secs, frame_ms, wait_ms, frame_ms - wait_ms, (double)g_fs.worst / 1e6, busy * 100.0, cores_used,
+                       hint, g_vsync_off, g_fps_cap, g_drs, g_res_state == RES_READY ? (int)(g_res_cur + 0.5) : 100);
+                  thread_report(secs);
+                  sys_snapshot();
+                  g_fs.thr_acc = 0;
+                  g_fs.proc_win_start = pnow;
                   g_fs.win_start = t;
                   g_fs.frames = 0;
                   g_fs.worst = 0;
@@ -794,6 +954,8 @@ jobs:
           /* ------------------------------------------------------------------ launcher lifecycle */
           EXPORT bool PLMod_Load(void) {
               g_active = 1;
+              load_pkg();
+              flog("PLMod_Load called (pid %d, process '%s')", (int)getpid(), g_pkg);
               start();
               return true;
           }
@@ -818,7 +980,8 @@ jobs:
           }
           FPSBOOST_EOF
           cat > out/FpsBoost.cfg <<'CFG_EOF'
-          # FpsBoost 0.4 settings. Put this file in /sdcard/Download (or /sdcard) and restart the game.
+          # FpsBoost 0.5 settings (optional - the mod works without this file).
+          # Place it in /sdcard/Android/media/org.levimc.launcher/ or /sdcard/Android/data/org.levimc.launcher/files/
           # --- render passes: 1 = skip (disable) that pass, 0 = leave it alone
           particles=1     # all particles (safe)
           flipbook=0      # animated textures (water/lava/fire frames freeze)
@@ -830,17 +993,17 @@ jobs:
           # --- GLES layer (works on any game build)
           vsync_off=1     # 1 = turn VSync off so FPS no longer snaps to 30/60
           fps_cap=0       # 0 = unlimited, or e.g. 60 to cap the frame rate (less heat)
-          fps_log=1       # write FPS + CPU/GPU hint to FpsBoost.log every 5 s
-          # --- DYNAMIC RESOLUTION: lowers the render resolution just enough to hold target_fps, raises it when there is headroom
-          drs=1           # 1 = on, 0 = off.  If the screen is black/garbled set drs=0 (or use the _nodrs build)
-          target_fps=60   # frame rate to hold
-          res_min=50      # never go below this percent of the screen resolution (25-100)
-          res_filter=1    # 1 = smooth stretch, 0 = sharp pixels
-          # res_scale=70  # optional: fixed scale (or starting scale) in percent; leave commented for automatic
+          fps_log=1       # write FPS, per-thread CPU use and CPU speed/temperature to FpsBoost.log every 5 s
+          # --- dynamic resolution (off in the normal build; on in libfpsboost_drs.so)
+          drs=0
+          target_fps=60
+          res_min=50
+          res_filter=1
+          # res_scale=70  # optional fixed scale in percent
           CFG_EOF
           wc -l mod/fpsboost.c
 
-      - name: Build libfpsboost.so and libfpsboost_nodrs.so (armeabi-v7a, Android NDK)
+      - name: Build the three mod variants (armeabi-v7a, Android NDK)
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
           if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
@@ -852,15 +1015,14 @@ jobs:
           "$CC" --version | head -n 1
           FLAGS="-shared -fPIC -O2 -Wall -Wextra -std=gnu11 -fvisibility=hidden -Wl,--build-id -Wl,-z,noexecstack"
           "$CC" $FLAGS -o out/libfpsboost.so mod/fpsboost.c -llog -ldl
-          "$CC" $FLAGS -DFPSBOOST_DEFAULT_DRS=0 -o out/libfpsboost_nodrs.so mod/fpsboost.c -llog -ldl
+          "$CC" $FLAGS -DFPSBOOST_PROOF=1 -o out/libfpsboost_proof.so mod/fpsboost.c -llog -ldl
+          "$CC" $FLAGS -DFPSBOOST_DEFAULT_DRS=1 -o out/libfpsboost_drs.so mod/fpsboost.c -llog -ldl
           ls -la out
-          for f in out/libfpsboost.so out/libfpsboost_nodrs.so; do
+          for f in out/libfpsboost.so out/libfpsboost_proof.so out/libfpsboost_drs.so; do
             echo "=== $f"
             file "$f"
             readelf -h "$f" | grep -E "Class|Machine"
             echo "--- needed libraries:"; readelf -d "$f" | grep NEEDED
-            echo "--- exported lifecycle symbols:"
-            readelf -W --dyn-syms "$f" | grep -E "PLMod_|LeviMod_"
             readelf -W --dyn-syms "$f" | grep -q PLMod_Load || { echo "PLMod_Load not exported"; exit 1; }
           done
 
