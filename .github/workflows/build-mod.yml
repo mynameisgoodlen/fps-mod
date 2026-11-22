@@ -19,7 +19,7 @@ jobs:
           mkdir -p mod out
           cat > mod/fpsboost.c <<'FPSBOOST_EOF'
           /*
-           * FpsBoost 0.6 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
+           * FpsBoost 0.8 - LeviLauncher native mod (armeabi-v7a, Minecraft Bedrock 32-bit)
            *
            * Skips selected RenderDragon frame-builder passes by hooking the tiny
            * FrameBuilder::insert<TDescription>() wrappers (found by reverse engineering).
@@ -40,6 +40,11 @@ jobs:
            * the target frame rate and raising it again when there is headroom.  If lowering the resolution does
            * not speed things up (CPU-bound), it backs off.  Self-checks disable it if the game bypasses the hooks.
            *
+           * v0.8: adds an in-process SAMPLING PROFILER (200 Hz, SIGPROF).  Every 30 s it writes the hottest game functions of
+           * the busiest threads (with their callers) to the log and to profile.tsv, so optimisation targets are chosen from
+           * evidence.  Measured on a 32-bit phone: GPU idle, MINECRAFT MAIN and Rendering Pool threads ~85% busy each.
+           * v0.7: NO behaviour changes by default any more (no particle/pass skipping, VSync untouched).  The mod now
+           * only measures (FPS, per-thread CPU, CPU speed/temperature, options.txt dump) until real culling hooks exist.
            * v0.6: finds the game's options.txt and copies it (plus its gfx_ keys) into the log folders so the real option
            * names for this build are known.  Fixes the EGL/GLES symbol lookup.  dlsym(RTLD_DEFAULT) cannot see libEGL/libGLES inside the launcher's
            * linker namespace (v0.2-v0.5 never hooked eglSwapBuffers), so they are now looked up through explicit
@@ -55,7 +60,11 @@ jobs:
           #define _GNU_SOURCE
           #include <android/log.h>
           #include <dirent.h>
+          #include <signal.h>
           #include <sys/stat.h>
+          #include <sys/syscall.h>
+          #include <sys/time.h>
+          #include <ucontext.h>
           #include <dlfcn.h>
           #include <link.h>
           #include <pthread.h>
@@ -115,7 +124,7 @@ jobs:
           static wrapper_fn orig_particles, orig_flipbook, orig_celestial, orig_endsky, orig_hand, orig_entities, orig_aimassist;
 
           static Hook g_hooks[H_COUNT] = {
-              [H_PARTICLES] = {"particles", "RenderParticleDescription (particles)", 0x06e57b44, 1, (PLFuncPtr)det_particles, &orig_particles, 0, 0},
+              [H_PARTICLES] = {"particles", "RenderParticleDescription (particles)", 0x06e57b44, 0, (PLFuncPtr)det_particles, &orig_particles, 0, 0},
               [H_FLIPBOOK]  = {"flipbook", "BlitFlipbookTextureDescription (animated textures)", 0x073dff04, 0, (PLFuncPtr)det_flipbook, &orig_flipbook, 0, 0},
               [H_CELESTIAL] = {"celestial", "RenderCelestialBodyDescription (sun/moon)", 0x073bbad8, PROOF_SKIP, (PLFuncPtr)det_celestial, &orig_celestial, 0, 0},
               [H_ENDSKY]    = {"endsky", "RenderEndSkyDescription (End sky)", 0x073bb8a0, 0, (PLFuncPtr)det_endsky, &orig_endsky, 0, 0},
@@ -130,10 +139,18 @@ jobs:
           static pl_unhook_fn g_pl_unhook;
           static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
           static void dump_options(void);
+          static void write_everywhere(const char *fname, const char *data, size_t len);
+          /* sampling profiler state (implemented further down) */
+          static uintptr_t g_game_base, g_game_end;
+          static int g_profile = 1;
+          static int g_prof_active;
+          static unsigned g_prof_windows;
+          static void prof_start(void);
+          static void prof_dump(int sync);
           static char g_pkg[128];
 
           /* GLES layer settings (config keys: vsync_off, fps_cap, fps_log) */
-          static int g_vsync_off = 1;
+          static int g_vsync_off = 0;
           static int g_fps_cap = 0;   /* 0 = unlimited */
           static int g_fps_log = 1;
           static unsigned g_log_interval_ms = 5000;
@@ -296,6 +313,7 @@ jobs:
               if (strcmp(k, "res_scale") == 0) { g_res_pct = val < 25 ? 25 : (val > 100 ? 100 : val); return; }
               if (strcmp(k, "res_filter") == 0) { g_res_filter = val ? 1 : 0; return; }
               if (strcmp(k, "drs") == 0) { g_drs = val ? 1 : 0; return; }
+              if (strcmp(k, "profile") == 0) { g_profile = val ? 1 : 0; return; }
               if (strcmp(k, "target_fps") == 0) { g_target_fps = val < 20 ? 20 : (val > 240 ? 240 : val); return; }
               if (strcmp(k, "res_min") == 0) { g_res_min = val < 25 ? 25 : (val > 100 ? 100 : val); return; }
               for (int i = 0; i < H_COUNT; i++) {
@@ -316,7 +334,7 @@ jobs:
                   f = fopen(path, "r");
               }
               if (!f) {
-                  flog("no FpsBoost.cfg found (looked in %s, %s, ...) - using built-in defaults", dirs[0], dirs[1]);
+                  flog("no FpsBoost.cfg found (looked in %s, %s, ...) - using built-in defaults (measure only, nothing is changed)", dirs[0], dirs[1]);
                   return;
               }
               flog("config: %s", path);
@@ -335,6 +353,7 @@ jobs:
           typedef struct {
               bool found;
               uintptr_t base;
+              uintptr_t end;
               char name[256];
               char build_id[96];
           } ModInfo;
@@ -348,6 +367,10 @@ jobs:
               snprintf(m->name, sizeof(m->name), "%s", info->dlpi_name);
               for (int i = 0; i < info->dlpi_phnum; i++) {
                   const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+                  if (ph->p_type == PT_LOAD) {
+                      uintptr_t e = (uintptr_t)info->dlpi_addr + ph->p_vaddr + ph->p_memsz;
+                      if (e > m->end) m->end = e;
+                  }
                   if (ph->p_type != PT_NOTE || ph->p_memsz == 0 || ph->p_memsz > 4096) continue;
                   const uint8_t *p = (const uint8_t *)(info->dlpi_addr + ph->p_vaddr);
                   size_t off = 0, len = ph->p_memsz;
@@ -410,7 +433,7 @@ jobs:
                   return 0;
               }
               g_state = 1;
-              flog("FpsBoost 0.6: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
+              flog("FpsBoost 0.8: game module %s base=0x%08lx build-id=%s", m.name, (unsigned long)m.base,
                    m.build_id[0] ? m.build_id : "(unreadable)");
               if (m.build_id[0] && strcmp(m.build_id, EXPECTED_BUILD_ID) != 0) {
                   flog("UNSUPPORTED game build (expected %s). Nothing was hooked.", EXPECTED_BUILD_ID);
@@ -441,7 +464,10 @@ jobs:
                   ok++;
               }
               flog("done: %d of %d requested hooks installed", ok, want);
+              g_game_base = m.base;
+              g_game_end = m.end;
               pthread_mutex_unlock(&g_lock);
+              prof_start();
               dump_options();
               return 1;
           }
@@ -842,6 +868,7 @@ jobs:
                        hint, g_vsync_off, g_fps_cap, g_drs, g_res_state == RES_READY ? (int)(g_res_cur + 0.5) : 100);
                   thread_report(secs);
                   sys_snapshot();
+                  if (g_prof_active && ++g_prof_windows % 6 == 0) prof_dump(0);
                   g_fs.thr_acc = 0;
                   g_fs.proc_win_start = pnow;
                   g_fs.win_start = t;
@@ -959,6 +986,248 @@ jobs:
               pthread_mutex_unlock(&g_lock);
           }
 
+
+
+          /* bounded printf-append: never writes past the buffer, never lets the length run away */
+          static void sappend(char *buf, size_t sz, size_t *len, const char *fmt, ...) {
+              if (*len >= sz - 1) return;
+              va_list ap;
+              va_start(ap, fmt);
+              int w = vsnprintf(buf + *len, sz - *len, fmt, ap);
+              va_end(ap);
+              if (w < 0) return;
+              size_t room = sz - *len - 1;
+              *len += (size_t)w < room ? (size_t)w : room;
+          }
+
+          /* ------------------------------------------------------------------ sampling profiler */
+          #define PROF_MAX 20000
+          typedef struct { uint32_t tid; uintptr_t pc, lr; } ProfSample;
+          static ProfSample g_prof[PROF_MAX];
+          static volatile uint32_t g_prof_n;
+
+          static void prof_handler(int sig, siginfo_t *si, void *ctx) {
+              (void)sig;
+              (void)si;
+              uint32_t i = __atomic_fetch_add(&g_prof_n, 1, __ATOMIC_RELAXED);
+              if (i >= PROF_MAX) return;
+              ucontext_t *uc = (ucontext_t *)ctx;
+              g_prof[i].tid = (uint32_t)syscall(SYS_gettid);
+          #if defined(__arm__)
+              g_prof[i].pc = (uintptr_t)uc->uc_mcontext.arm_pc;
+              g_prof[i].lr = (uintptr_t)uc->uc_mcontext.arm_lr;
+          #elif defined(__x86_64__)
+              g_prof[i].pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+              g_prof[i].lr = 0;
+          #else
+              (void)uc;
+          #endif
+          }
+
+          static void prof_timer(int on) {
+              struct itimerval it;
+              memset(&it, 0, sizeof(it));
+              if (on) {
+                  it.it_interval.tv_usec = 5000;           /* 200 Hz of process CPU time */
+                  it.it_value.tv_usec = 5000;
+              }
+              setitimer(ITIMER_PROF, &it, NULL);
+          }
+
+          static void prof_start(void) {
+              if (!g_profile || g_prof_active) return;
+              struct sigaction sa;
+              memset(&sa, 0, sizeof(sa));
+              sa.sa_sigaction = prof_handler;
+              sa.sa_flags = SA_SIGINFO | SA_RESTART;
+              sigemptyset(&sa.sa_mask);
+              if (sigaction(SIGPROF, &sa, NULL) != 0) {
+                  flog("profiler: sigaction failed");
+                  return;
+              }
+              g_prof_active = 1;
+              prof_timer(1);
+              flog("profiler: sampling at 200 Hz, report every ~30 s (game code at 0x%lx-0x%lx)", (unsigned long)g_game_base,
+                   (unsigned long)g_game_end);
+          }
+
+          /* nearest 'push {..., lr}' at or before p (Thumb-2), searching at most maxhw halfwords back but not below lo */
+          __attribute__((unused)) static const uint16_t *thumb_func_start(const uint16_t *p, const uint16_t *lo, int maxhw) {
+              for (int i = 0; i < maxhw; i++) {
+                  const uint16_t *q = p - i;
+                  if (q < lo) break;
+                  uint16_t h = q[0];
+                  if ((h & 0xFF00) == 0xB500) return q;                      /* push {..., lr} */
+                  if (h == 0xE92D && (q[1] & 0x4000)) return q;               /* push.w {..., lr} */
+              }
+              return NULL;
+          }
+
+          /* best guess of the start of the function that contains pc */
+          static uintptr_t guess_func_start(uintptr_t pc) {
+          #if defined(__arm__)
+              if (pc < g_game_base || pc >= g_game_end) return 0;
+              const uint16_t *f = thumb_func_start((const uint16_t *)(pc & ~(uintptr_t)1), (const uint16_t *)g_game_base, 0x1800);
+              return (uintptr_t)f;
+          #else
+              Dl_info di;
+              if (dladdr((void *)pc, &di) && di.dli_saddr) return (uintptr_t)di.dli_saddr;
+              return 0;
+          #endif
+          }
+
+          typedef struct { uintptr_t fn, caller; uint32_t count; } FnRow;
+          static int cmp_fn(const void *a, const void *b) {
+              const FnRow *x = (const FnRow *)a, *y = (const FnRow *)b;
+              return x->fn < y->fn ? -1 : (x->fn > y->fn ? 1 : 0);
+          }
+          static int cmp_count_desc(const void *a, const void *b) {
+              const FnRow *x = (const FnRow *)a, *y = (const FnRow *)b;
+              return x->count < y->count ? 1 : (x->count > y->count ? -1 : 0);
+          }
+
+          typedef struct { ProfSample *s; uint32_t n; } ProfJob;
+
+          static void thread_name_of(uint32_t tid, char *out, size_t sz) {
+              char path[64];
+              snprintf(path, sizeof(path), "/proc/self/task/%u/comm", tid);
+              out[0] = 0;
+              FILE *f = fopen(path, "r");
+              if (f) {
+                  if (fgets(out, (int)sz, f)) out[strcspn(out, "\r\n")] = 0;
+                  fclose(f);
+              }
+              if (!out[0]) snprintf(out, sz, "tid%u", tid);
+          }
+
+          static void *prof_process(void *arg) {
+              ProfJob *job = (ProfJob *)arg;
+              ProfSample *s = job->s;
+              uint32_t n = job->n;
+              /* distinct threads, by sample count */
+              typedef struct { uint32_t tid, total, game; } TRow;
+              TRow th[48];
+              int nth = 0;
+              for (uint32_t i = 0; i < n; i++) {
+                  int k = 0;
+                  while (k < nth && th[k].tid != s[i].tid) k++;
+                  if (k == nth) {
+                      if (nth >= 48) continue;
+                      th[nth].tid = s[i].tid;
+                      th[nth].total = th[nth].game = 0;
+                      nth++;
+                  }
+                  th[k].total++;
+                  if (s[i].pc >= g_game_base && s[i].pc < g_game_end) th[k].game++;
+              }
+              /* busiest threads first */
+              for (int a = 0; a < nth; a++)
+                  for (int b = a + 1; b < nth; b++)
+                      if (th[b].total > th[a].total) { TRow t = th[a]; th[a] = th[b]; th[b] = t; }
+              flog("prof: %u samples from %d threads (200 Hz of CPU time)", n, nth);
+              static char tsv[40000];
+              size_t tl = 0;
+              tsv[0] = 0;
+              sappend(tsv, sizeof(tsv), &tl, "thread\tfunc_rva\tsamples\tpct_of_thread\tcaller_rva\n");
+
+              for (int ti = 0; ti < nth && ti < 4; ti++) {
+                  char name[24];
+                  thread_name_of(th[ti].tid, name, sizeof(name));
+                  /* other libraries (GL driver, libc ...): count by file name */
+                  char libs[4][40];
+                  uint32_t libc_[4] = {0, 0, 0, 0};
+                  int nl = 0;
+                  FnRow *rows = (FnRow *)malloc(sizeof(FnRow) * (th[ti].game + 1));
+                  if (!rows) continue;
+                  uint32_t nr = 0;
+                  for (uint32_t i = 0; i < n; i++) {
+                      if (s[i].tid != th[ti].tid) continue;
+                      uintptr_t pc = s[i].pc;
+                      if (pc >= g_game_base && pc < g_game_end) {
+                          rows[nr].fn = guess_func_start(pc);
+                          rows[nr].caller = guess_func_start(s[i].lr);
+                          rows[nr].count = 1;
+                          nr++;
+                      } else {
+                          Dl_info di;
+                          memset(&di, 0, sizeof(di));
+                          const char *nm = "?";
+                          if (dladdr((void *)pc, &di) && di.dli_fname) {
+                              const char *slash = strrchr(di.dli_fname, '/');
+                              nm = slash ? slash + 1 : di.dli_fname;
+                          }
+                          int k = 0;
+                          while (k < nl && strncmp(libs[k], nm, 39) != 0) k++;
+                          if (k == nl && nl < 4) { snprintf(libs[nl], 40, "%s", nm); nl++; }
+                          if (k < nl) libc_[k]++;
+                      }
+                  }
+                  qsort(rows, nr, sizeof(FnRow), cmp_fn);
+                  /* collapse equal functions, remember the most common caller (first seen is enough for a rough view) */
+                  uint32_t m = 0;
+                  for (uint32_t i = 0; i < nr; i++) {
+                      if (m && rows[m - 1].fn == rows[i].fn) rows[m - 1].count++;
+                      else rows[m++] = rows[i];
+                  }
+                  qsort(rows, m, sizeof(FnRow), cmp_count_desc);
+                  char line[760];
+                  size_t len = 0;
+                  line[0] = 0;
+                  sappend(line, sizeof(line), &len, "prof [%s/%u] %u samples, in game code %u%%, other:", name, th[ti].tid, th[ti].total,
+                          th[ti].total ? th[ti].game * 100 / th[ti].total : 0);
+                  for (int k = 0; k < nl; k++)
+                      sappend(line, sizeof(line), &len, " %s %u%%", libs[k], th[ti].total ? libc_[k] * 100 / th[ti].total : 0);
+                  flog("%s", line);
+                  len = 0;
+                  line[0] = 0;
+                  sappend(line, sizeof(line), &len, "prof [%s] hot game functions (rva=share<-caller):", name);
+                  for (uint32_t k = 0; k < m && k < 14; k++)
+                      sappend(line, sizeof(line), &len, " 0x%x=%u%%<-0x%x", (unsigned)(rows[k].fn - g_game_base),
+                              th[ti].total ? rows[k].count * 100 / th[ti].total : 0,
+                              rows[k].caller ? (unsigned)(rows[k].caller - g_game_base) : 0u);
+                  flog("%s", line);
+                  for (uint32_t k = 0; k < m && rows[k].count >= 2; k++)
+                      sappend(tsv, sizeof(tsv), &tl, "%s\t0x%x\t%u\t%u\t0x%x\n", name, (unsigned)(rows[k].fn - g_game_base), rows[k].count,
+                              th[ti].total ? rows[k].count * 100 / th[ti].total : 0,
+                              rows[k].caller ? (unsigned)(rows[k].caller - g_game_base) : 0u);
+                  free(rows);
+              }
+              write_everywhere("profile.tsv", tsv, tl);
+              free(s);
+              free(job);
+              return NULL;
+          }
+
+          /* take a snapshot of the samples and process it (sync = in this thread, otherwise in a helper thread) */
+          static void prof_dump(int sync) {
+              if (!g_prof_active) return;
+              prof_timer(0);
+              uint32_t n = g_prof_n;
+              if (n > PROF_MAX) n = PROF_MAX;
+              ProfJob *job = (ProfJob *)malloc(sizeof(ProfJob));
+              ProfSample *copy = (ProfSample *)malloc(sizeof(ProfSample) * (n ? n : 1));
+              if (!job || !copy) {
+                  free(job);
+                  free(copy);
+                  prof_timer(1);
+                  return;
+              }
+              memcpy(copy, g_prof, sizeof(ProfSample) * n);
+              g_prof_n = 0;
+              prof_timer(1);
+              job->s = copy;
+              job->n = n;
+              if (sync) {
+                  prof_process(job);
+                  return;
+              }
+              pthread_t t;
+              if (pthread_create(&t, NULL, prof_process, job) == 0) pthread_detach(t);
+              else {
+                  free(copy);
+                  free(job);
+              }
+          }
 
           /* ------------------------------------------------------------------ options.txt discovery (diagnostic) */
           /* depth-limited search for a file called `name` under `root`; returns 1 and fills `out` when found */
@@ -1094,26 +1363,20 @@ jobs:
           }
           FPSBOOST_EOF
           cat > out/FpsBoost.cfg <<'CFG_EOF'
-          # FpsBoost 0.6 settings (optional - the mod works without this file).
+          # FpsBoost 0.8 settings (optional - the mod works without this file and changes NOTHING by default).
           # Place it in /sdcard/Android/media/org.levimc.launcher/ or /sdcard/Android/data/org.levimc.launcher/files/
-          particles=1     # 1 = skip all particles
-          flipbook=0      # animated textures
-          celestial=0     # sun and moon
-          endsky=0        # End dimension sky
-          hand=0          # held item in first person
-          entities=0      # batched entities: mobs become INVISIBLE (benchmark only!)
-          aimassist=0     # aim-assist highlight
-          vsync_off=1     # turn VSync off
+          vsync_off=0     # 1 = force VSync off (only useful if your screen can show more than the cap)
           fps_cap=0       # 0 = unlimited
           fps_log=1       # FPS + per-thread CPU + CPU speed/temperature in FpsBoost.log every 5 s
-          drs=0           # dynamic resolution (the _drs build turns it on)
+          profile=1       # sampling profiler: hottest game functions per thread every ~30 s (log + profile.tsv)
+          drs=0           # dynamic resolution (the _drs build turns it on) - useless while CPU-bound
           target_fps=60
           res_min=50
           res_filter=1
           CFG_EOF
           wc -l mod/fpsboost.c
 
-      - name: Build the three mod variants (armeabi-v7a, Android NDK)
+      - name: Build the two mod variants (armeabi-v7a, Android NDK)
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
           if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
@@ -1125,10 +1388,9 @@ jobs:
           "$CC" --version | head -n 1
           FLAGS="-shared -fPIC -O2 -Wall -Wextra -std=gnu11 -fvisibility=hidden -Wl,--build-id -Wl,-z,noexecstack"
           "$CC" $FLAGS -o out/libfpsboost.so mod/fpsboost.c -llog -ldl
-          "$CC" $FLAGS -DFPSBOOST_PROOF=1 -o out/libfpsboost_proof.so mod/fpsboost.c -llog -ldl
           "$CC" $FLAGS -DFPSBOOST_DEFAULT_DRS=1 -o out/libfpsboost_drs.so mod/fpsboost.c -llog -ldl
           ls -la out
-          for f in out/libfpsboost.so out/libfpsboost_proof.so out/libfpsboost_drs.so; do
+          for f in out/libfpsboost.so out/libfpsboost_drs.so; do
             echo "=== $f"
             file "$f"
             readelf -h "$f" | grep -E "Class|Machine"
