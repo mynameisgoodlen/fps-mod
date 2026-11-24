@@ -4,57 +4,595 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - fpsboost.c
-      - .github/workflows/build.yml
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Write mod source
+        run: |
+          mkdir -p mod out
+          cat > mod/fpsboost.c <<'FPSBOOST_EOF'
+          /*
+           * FpsBoost 1.0 - LeviLauncher native mod, 32-bit ARM (armeabi-v7a)
+           *
+           * One source, three builds (define exactly one):
+           *   -DFB_OFF      libfpsboost_off.so      does nothing at all (baseline)
+           *   -DFB_EXP      libfpsboost.so          worker-thread experiment
+           *   -DFB_MEASURE  libfpsboost_measure.so  read-only thread/core report
+           *
+           * No hooks, no signals, no GL, no work on the game's MAIN or render thread.
+           * The only thing this file ever does is run ONE low-priority background
+           * thread that reads /proc/self/task.
+           *
+           * EXP: threads named "Thread-<N>" that have used >= min_cpu_ms of CPU are
+           * moved to the slow cores with a higher nice value. MINECRAFT MAIN and
+           * Rendering Pool are never touched. Nothing is pinned unless the CPU has a
+           * clearly faster set of >= 3 cores AND at least one slower core.
+           *
+           * Optional FpsBoost.cfg (key=value, '#' comments), looked up in
+           *   /sdcard/Android/media/<pkg>/   then   /sdcard/Android/data/<pkg>/files/
+           *   nice=4          EXP: nice added to moved workers (1..19)
+           *   min_cpu_ms=500  EXP: CPU time a Thread-N needs before it is moved
+           *   poll_ms=3000    EXP: scan interval
+           *   log=1           0 = create/write no log file at all
+           *   report_s=30     MEASURE: seconds between reports
+           */
+          #define _GNU_SOURCE
+          #include <stdbool.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdarg.h>
+          #include <errno.h>
+          #include <time.h>
+          #include <unistd.h>
+          #include <pthread.h>
+          #include <sched.h>
+          #include <dirent.h>
+          #include <link.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <sys/resource.h>
+          #include <sys/syscall.h>
+          #include <sys/prctl.h>
+
+          #if (defined(FB_OFF) + defined(FB_EXP) + defined(FB_MEASURE)) != 1
+          #error "define exactly one of FB_OFF, FB_EXP, FB_MEASURE"
+          #endif
+
+          #define FB_VERSION "1.0"
+          #define FB_EXPORT __attribute__((visibility("default")))
+
+          #ifdef FB_OFF
+          /* ------------------------------------------------------------------ OFF */
+          FB_EXPORT bool PLMod_Load(void)    { return true; }
+          FB_EXPORT bool PLMod_Enable(void)  { return true; }
+          FB_EXPORT bool PLMod_Disable(void) { return true; }
+          FB_EXPORT bool PLMod_Unload(void)  { return true; }
+          FB_EXPORT bool LeviMod_Load(void)  { return true; }
+          #else
+          /* ------------------------------------------------------- EXP / MEASURE */
+
+          /* Overridable only so the host tests can use a fake /proc and /sys. */
+          #ifndef FB_TASK_DIR
+          #define FB_TASK_DIR "/proc/self/task"
+          #endif
+          #ifndef FB_CPU_DIR
+          #define FB_CPU_DIR "/sys/devices/system/cpu"
+          #endif
+          #ifndef FB_CMDLINE
+          #define FB_CMDLINE "/proc/self/cmdline"
+          #endif
+          #ifndef FB_GAME_LIB
+          #define FB_GAME_LIB "libminecraftpe.so"
+          #endif
+          #ifndef FB_MEDIA_ROOT
+          #define FB_MEDIA_ROOT "/sdcard/Android/media"
+          #endif
+          #ifndef FB_DATA_ROOT
+          #define FB_DATA_ROOT "/sdcard/Android/data"
+          #endif
+          #ifndef FB_NCPU
+          #define FB_NCPU() ((int)sysconf(_SC_NPROCESSORS_CONF))
+          #endif
+
+          #define MAXT   1024
+          #define MAXCPU 32
+
+          #ifdef FB_EXP
+          #define FB_VARIANT "exp"
+          #define FB_LOG_CAP 40          /* the exp build can never write more than this */
+          #else
+          #define FB_VARIANT "measure"
+          #define FB_LOG_CAP 0           /* 0 = no cap (one report every report_s) */
+          #endif
+
+          struct cfg { int nice, min_cpu_ms, poll_ms, log, report_s; };
+          static struct cfg g_cfg = { 4, 500, 3000, 1, 30 };
+
+          static volatile int g_stop;
+          static volatile int g_active = 1;
+          static int g_started;
+          static pthread_t g_thr;
+          static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
+
+          static char g_pkg[96];
+          static char g_dirs[2][200];
+          static int  g_ndirs;
+          static char g_logpath[512];
+          static int  g_log_lines;
+
+          /* ---------------------------------------------------------------- utils */
+          #ifdef FB_MEASURE
+          static long long now_ms(void) {
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+          }
+          #endif
+          static void sleep_ms(int ms) {
+              struct timespec ts;
+              ts.tv_sec = ms / 1000;
+              ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+              nanosleep(&ts, NULL);
+          }
+          static int clampi(long v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : (int)v); }
+
+          __attribute__((format(printf, 1, 2)))
+          static void flog(const char *fmt, ...) {
+              if (!g_cfg.log || !g_logpath[0]) return;
+              if (FB_LOG_CAP > 0 && g_log_lines >= FB_LOG_CAP) return;
+              FILE *f = fopen(g_logpath, "a");
+              if (!f) return;
+              time_t t = time(NULL);
+              struct tm tm;
+              localtime_r(&t, &tm);
+              fprintf(f, "[%02d:%02d:%02d] ", tm.tm_hour, tm.tm_min, tm.tm_sec);
+              va_list ap;
+              va_start(ap, fmt);
+              vfprintf(f, fmt, ap);
+              va_end(ap);
+              fputc('\n', f);
+              g_log_lines++;
+              if (FB_LOG_CAP > 0 && g_log_lines >= FB_LOG_CAP)
+                  fprintf(f, "[--:--:--] log cap (%d lines) reached, silent from here\n", FB_LOG_CAP);
+              fclose(f);
+          }
+
+          static void init_paths(void) {
+              char buf[96];
+              size_t n = 0;
+              FILE *f = fopen(FB_CMDLINE, "r");
+              if (f) { n = fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+              buf[n] = 0;
+              char *c = strchr(buf, ':');
+              if (c) *c = 0;
+              int ok = buf[0] != 0 && strchr(buf, '.') != NULL;
+              for (const char *p = buf; ok && *p; p++)
+                  if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                        (*p >= '0' && *p <= '9') || *p == '.' || *p == '_')) ok = 0;
+              snprintf(g_pkg, sizeof g_pkg, "%s", ok ? buf : "org.levimc.launcher");
+              snprintf(g_dirs[0], sizeof g_dirs[0], "%s/%s", FB_MEDIA_ROOT, g_pkg);
+              snprintf(g_dirs[1], sizeof g_dirs[1], "%s/%s/files", FB_DATA_ROOT, g_pkg);
+              g_ndirs = 2;
+          }
+
+          /* Only called when log=1: probes the dirs in order and remembers the first writable one. */
+          static void choose_logpath(void) {
+              g_logpath[0] = 0;
+              for (int i = 0; i < g_ndirs && !g_logpath[0]; i++) {
+                  if (i == 0) mkdir(g_dirs[0], 0775);
+                  char p[512];
+                  snprintf(p, sizeof p, "%s/FpsBoost.log", g_dirs[i]);
+                  FILE *t = fopen(p, "a");
+                  if (t) { fclose(t); snprintf(g_logpath, sizeof g_logpath, "%s", p); }
+              }
+          }
+
+          static int load_cfg(char *used, size_t usedlen) {
+              for (int d = 0; d < g_ndirs; d++) {
+                  char p[512];
+                  snprintf(p, sizeof p, "%s/FpsBoost.cfg", g_dirs[d]);
+                  FILE *f = fopen(p, "r");
+                  if (!f) continue;
+                  char line[160];
+                  while (fgets(line, sizeof line, f)) {
+                      char *s = line;
+                      while (*s == ' ' || *s == '\t') s++;
+                      if (*s == '#' || *s == ';' || *s == '\n' || *s == '\r' || !*s) continue;
+                      char *eq = strchr(s, '=');
+                      if (!eq) continue;
+                      *eq = 0;
+                      char *k = s, *v = eq + 1;
+                      for (char *e = k + strlen(k); e > k && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+                      while (*v == ' ' || *v == '\t') v++;
+                      long x = strtol(v, NULL, 10);
+                      if      (!strcmp(k, "nice"))        g_cfg.nice       = clampi(x, 1, 19);
+                      else if (!strcmp(k, "min_cpu_ms"))  g_cfg.min_cpu_ms = clampi(x, 0, 60000);
+                      else if (!strcmp(k, "poll_ms"))     g_cfg.poll_ms    = clampi(x, 500, 30000);
+                      else if (!strcmp(k, "log"))         g_cfg.log        = x != 0;
+                      else if (!strcmp(k, "report_s"))    g_cfg.report_s   = clampi(x, 5, 600);
+                  }
+                  fclose(f);
+                  snprintf(used, usedlen, "%s", p);
+                  return 1;
+              }
+              return 0;
+          }
+
+          /* ---------------------------------------------------------- core choice */
+          struct cores {
+              int n, ok, nfast, nslow;
+              long khz[MAXCPU];
+              cpu_set_t fast, slow;
+              char why[96];
+          };
+
+          static void mask_str(const cpu_set_t *m, int n, char *out, size_t len) {
+              size_t o = 0;
+              int i = 0;
+              out[0] = 0;
+              while (i < n) {
+                  if (!CPU_ISSET(i, m)) { i++; continue; }
+                  int j = i;
+                  while (j + 1 < n && CPU_ISSET(j + 1, m)) j++;
+                  int w = (j > i) ? snprintf(out + o, len - o, "%s%d-%d", o ? "," : "", i, j)
+                                  : snprintf(out + o, len - o, "%s%d", o ? "," : "", i);
+                  if (w < 0 || (size_t)w >= len - o) break;
+                  o += (size_t)w;
+                  i = j + 1;
+              }
+              if (!o) snprintf(out, len, "-");
+          }
+
+          /* fast = cores >= 90% of the top max freq. Pin only if the cores clearly
+           * differ (>10%), fast has >= 3 cores and there is >= 1 slower core.
+           * Cores whose max freq is unreadable are ignored (in neither set). */
+          static void pick_cores(struct cores *c) {
+              memset(c, 0, sizeof *c);
+              CPU_ZERO(&c->fast);
+              CPU_ZERO(&c->slow);
+              int n = FB_NCPU();
+              if (n < 1) n = 1;
+              if (n > MAXCPU) n = MAXCPU;
+              c->n = n;
+              long mx = 0, mn = 0;
+              for (int i = 0; i < n; i++) {
+                  char p[160];
+                  snprintf(p, sizeof p, FB_CPU_DIR "/cpu%d/cpufreq/cpuinfo_max_freq", i);
+                  FILE *f = fopen(p, "r");
+                  long v = 0;
+                  if (f) { if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f); }
+                  if (v < 0) v = 0;
+                  c->khz[i] = v;
+                  if (v > mx) mx = v;
+                  if (v > 0 && (mn == 0 || v < mn)) mn = v;
+              }
+              if (mx == 0) { snprintf(c->why, sizeof c->why, "max freq unreadable"); return; }
+              if ((long long)(mx - mn) * 100 < (long long)mx * 10) {
+                  snprintf(c->why, sizeof c->why, "cores look alike (%ld-%ld MHz)", mn / 1000, mx / 1000);
+                  return;
+              }
+              for (int i = 0; i < n; i++) {
+                  if (c->khz[i] <= 0) continue;
+                  if ((long long)c->khz[i] * 100 >= (long long)mx * 90) { CPU_SET(i, &c->fast); c->nfast++; }
+                  else                                                   { CPU_SET(i, &c->slow); c->nslow++; }
+              }
+              if (c->nfast < 3) { snprintf(c->why, sizeof c->why, "fast set has %d cores (need >= 3)", c->nfast); return; }
+              if (c->nslow < 1) { snprintf(c->why, sizeof c->why, "no slower cores"); return; }
+              c->ok = 1;
+          }
+
+          /* -------------------------------------------------------------- threads */
+          struct thr { int tid; int cpu; unsigned long long ticks; char name[20]; };
+
+          static int read_thr(int tid, struct thr *t) {
+              char path[96], buf[1024];
+              snprintf(path, sizeof path, FB_TASK_DIR "/%d/stat", tid);
+              FILE *f = fopen(path, "r");
+              if (!f) return 0;
+              size_t n = fread(buf, 1, sizeof buf - 1, f);
+              fclose(f);
+              buf[n] = 0;
+              char *lp = strchr(buf, '('), *rp = strrchr(buf, ')');
+              if (!lp || !rp || rp < lp) return 0;
+              size_t nl = (size_t)(rp - lp - 1);
+              if (nl >= sizeof t->name) nl = sizeof t->name - 1;
+              memcpy(t->name, lp + 1, nl);
+              t->name[nl] = 0;
+              /* fields after ")": 3=state ... 14=utime 15=stime ... 39=processor */
+              char *p = rp + 1;
+              int field = 3, have = 0;
+              unsigned long long ut = 0, st = 0;
+              t->cpu = -1;
+              while (*p) {
+                  while (*p == ' ') p++;
+                  if (!*p || *p == '\n') break;
+                  char *e = p;
+                  while (*e && *e != ' ' && *e != '\n') e++;
+                  if (field == 14)      { ut = strtoull(p, NULL, 10); have |= 1; }
+                  else if (field == 15) { st = strtoull(p, NULL, 10); have |= 2; }
+                  else if (field == 39) { t->cpu = atoi(p); break; }
+                  field++;
+                  p = e;
+              }
+              if (have != 3) return 0;
+              t->tid = tid;
+              t->ticks = ut + st;
+              return 1;
+          }
+
+          static int snapshot(struct thr *out, int max) {
+              DIR *d = opendir(FB_TASK_DIR);
+              if (!d) return 0;
+              int n = 0;
+              struct dirent *e;
+              while (n < max && (e = readdir(d)) != NULL) {
+                  if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+                  if (read_thr(atoi(e->d_name), &out[n])) n++;
+              }
+              closedir(d);
+              return n;
+          }
+
+          static int phdr_cb(struct dl_phdr_info *i, size_t sz, void *d) {
+              (void)sz;
+              if (i->dlpi_name && strstr(i->dlpi_name, FB_GAME_LIB)) { *(int *)d = 1; return 1; }
+              return 0;
+          }
+          static int game_loaded(void) {
+              static int found;
+              if (found) return 1;
+              int f = 0;
+              dl_iterate_phdr(phdr_cb, &f);
+              if (f) found = 1;
+              return found;
+          }
+
+          /* ------------------------------------------------------------------ EXP */
+          #ifdef FB_EXP
+          static int is_worker_name(const char *s) {
+              if (strncmp(s, "Thread-", 7) != 0) return 0;
+              s += 7;
+              if (!*s) return 0;
+              for (; *s; s++) if (*s < '0' || *s > '9') return 0;
+              return 1;
+          }
+
+          static int g_done[MAXT];
+          static unsigned char g_seen[MAXT];
+          static int g_ndone;
+
+          /* One scan. Returns how many threads were moved in this pass. */
+          static int exp_scan(const cpu_set_t *slow, int self) {
+              static struct thr cur[MAXT];
+              long hz = sysconf(_SC_CLK_TCK);
+              if (hz < 1) hz = 100;
+              int n = snapshot(cur, MAXT), moved = 0;
+              memset(g_seen, 0, sizeof g_seen);
+              for (int i = 0; i < n; i++) {
+                  struct thr *t = &cur[i];
+                  int j = 0;
+                  while (j < g_ndone && g_done[j] != t->tid) j++;
+                  if (j < g_ndone) { g_seen[j] = 1; continue; }
+                  if (t->tid == self || !is_worker_name(t->name)) continue;
+                  long long ms = (long long)(t->ticks * 1000ULL / (unsigned long long)hz);
+                  if (ms < g_cfg.min_cpu_ms) continue;
+                  int a = sched_setaffinity((pid_t)t->tid, sizeof *slow, slow);
+                  int ae = a ? errno : 0;
+                  int p = setpriority(PRIO_PROCESS, (id_t)t->tid, g_cfg.nice);
+                  int pe = p ? errno : 0;
+                  if (g_ndone < MAXT) { g_done[g_ndone] = t->tid; g_seen[g_ndone] = 1; g_ndone++; }
+                  moved++;
+                  flog("moved %s/%d (%lld ms CPU so far): affinity %s, nice %s", t->name, t->tid, ms,
+                       a ? "FAILED" : "ok", p ? "FAILED" : "ok");
+                  if (a || p) flog("  errno: affinity=%d nice=%d", ae, pe);
+              }
+              int k = 0;                              /* forget threads that are gone */
+              for (int j = 0; j < g_ndone; j++)
+                  if (g_seen[j]) g_done[k++] = g_done[j];
+              g_ndone = k;
+              return moved;
+          }
+          #endif
+
+          /* -------------------------------------------------------------- MEASURE */
+          #ifdef FB_MEASURE
+          struct row { int tid, pct10, cpu; char name[20]; };
+          static struct thr g_prev[MAXT];
+          static int g_nprev;
+          static long long g_prev_ms;
+
+          static int cmp_row(const void *a, const void *b) {
+              return ((const struct row *)b)->pct10 - ((const struct row *)a)->pct10;
+          }
+
+          static void measure_tick(const struct cores *cs, int self) {
+              static struct thr cur[MAXT];
+              static struct row rows[MAXT];
+              long hz = sysconf(_SC_CLK_TCK);
+              if (hz < 1) hz = 100;
+              long long t = now_ms();
+              int n = snapshot(cur, MAXT);
+              if (g_prev_ms > 0 && t > g_prev_ms) {
+                  long long dt = t - g_prev_ms;
+                  int nr = 0;
+                  long long total = 0, fastp = 0, slowp = 0;
+                  for (int i = 0; i < n; i++) {
+                      if (cur[i].tid == self) continue;
+                      unsigned long long d = cur[i].ticks;
+                      for (int j = 0; j < g_nprev; j++)
+                          if (g_prev[j].tid == cur[i].tid) {
+                              d = cur[i].ticks >= g_prev[j].ticks ? cur[i].ticks - g_prev[j].ticks : 0;
+                              break;
+                          }
+                      long long dms = (long long)(d * 1000ULL / (unsigned long long)hz);
+                      int pct10 = (int)(dms * 1000 / dt);
+                      total += pct10;
+                      if (cs->ok && cur[i].cpu >= 0 && cur[i].cpu < MAXCPU) {
+                          if (CPU_ISSET(cur[i].cpu, &cs->fast)) fastp += pct10;
+                          else if (CPU_ISSET(cur[i].cpu, &cs->slow)) slowp += pct10;
+                      }
+                      rows[nr].tid = cur[i].tid;
+                      rows[nr].pct10 = pct10;
+                      rows[nr].cpu = cur[i].cpu;
+                      snprintf(rows[nr].name, sizeof rows[nr].name, "%s", cur[i].name);
+                      nr++;
+                  }
+                  qsort(rows, (size_t)nr, sizeof rows[0], cmp_row);
+                  char mhz[200] = "";
+                  size_t o = 0;
+                  for (int i = 0; i < cs->n && o + 12 < sizeof mhz; i++) {
+                      char p[160];
+                      snprintf(p, sizeof p, FB_CPU_DIR "/cpu%d/cpufreq/scaling_cur_freq", i);
+                      FILE *f = fopen(p, "r");
+                      long v = -1;
+                      if (f) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); }
+                      int w = v >= 0 ? snprintf(mhz + o, sizeof mhz - o, " %ld", v / 1000)
+                                     : snprintf(mhz + o, sizeof mhz - o, " ?");
+                      if (w > 0) o += (size_t)w;
+                  }
+                  flog("MEASURE %lld.%lld s | %d threads | process %lld.%lld cores | by last cpu: fast %lld.%lld slow %lld.%lld (approx) | cur MHz:%s",
+                       dt / 1000, (dt % 1000) / 100, nr, total / 1000, (total / 100) % 10,
+                       fastp / 1000, (fastp / 100) % 10, slowp / 1000, (slowp / 100) % 10, mhz);
+                  for (int i = 0; i < nr && i < 16 && rows[i].pct10 >= 30; i++)
+                      flog("  [%s] tid %d  %d.%d%%  last cpu %d", rows[i].name, rows[i].tid,
+                           rows[i].pct10 / 10, rows[i].pct10 % 10, rows[i].cpu);
+              }
+              memcpy(g_prev, cur, (size_t)n * sizeof cur[0]);
+              g_nprev = n;
+              g_prev_ms = t;
+          }
+          #endif
+
+          /* --------------------------------------------------------------- worker */
+          static void *worker(void *arg) {
+              (void)arg;
+              prctl(PR_SET_NAME, "FpsBoost-bg", 0, 0, 0);
+              int self = (int)syscall(__NR_gettid);
+              setpriority(PRIO_PROCESS, (id_t)self, 19);
+
+              init_paths();
+              char used[512] = "";
+              int have_cfg = load_cfg(used, sizeof used);
+              if (g_cfg.log) choose_logpath();
+              struct cores cs;
+              pick_cores(&cs);
+
+              flog("=== FpsBoost %s (%s) pid %d ===", FB_VERSION, FB_VARIANT, (int)getpid());
+              flog("config: %s", have_cfg ? used : "none, built-in defaults");
+              {
+                  char f[64], s[64];
+                  mask_str(&cs.fast, cs.n, f, sizeof f);
+                  mask_str(&cs.slow, cs.n, s, sizeof s);
+                  if (cs.ok) flog("cores: fast %s (%d), slow %s (%d)", f, cs.nfast, s, cs.nslow);
+                  else       flog("cores: not splitting (%s)", cs.why);
+              }
+          #ifdef FB_EXP
+              flog("exp: Thread-N with >= %d ms CPU -> slow cores, nice +%d, poll %d ms%s",
+                   g_cfg.min_cpu_ms, g_cfg.nice, g_cfg.poll_ms, cs.ok ? "" : " | DISABLED on this CPU");
+              if (cs.ok) sched_setaffinity((pid_t)self, sizeof cs.slow, &cs.slow);   /* keep the helper off the fast cores */
+              int interval = g_cfg.poll_ms;
+          #else
+              flog("measure: report every %d s, nothing is changed", g_cfg.report_s);
+              int interval = g_cfg.report_s * 1000;
+          #endif
+
+              int announced = 0, wait = 1000;
+              for (;;) {
+                  for (int w = 0; w < wait && !g_stop; w += 100) sleep_ms(100);
+                  if (g_stop) break;
+                  if (!g_active) continue;
+                  if (!game_loaded()) { wait = 1000; continue; }
+                  if (!announced) { announced = 1; flog("game library present, running"); }
+                  wait = interval;
+          #ifdef FB_EXP
+                  if (cs.ok) exp_scan(&cs.slow, self);
+          #else
+                  measure_tick(&cs, self);
+          #endif
+              }
+              return NULL;
+          }
+
+          /* -------------------------------------------------------------- exports */
+          static void stop_worker(void) {
+              pthread_mutex_lock(&g_mx);
+              if (g_started) { g_stop = 1; pthread_join(g_thr, NULL); g_started = 0; }
+              pthread_mutex_unlock(&g_mx);
+          }
+
+          FB_EXPORT bool PLMod_Load(void) {
+              pthread_mutex_lock(&g_mx);
+              if (!g_started) {
+                  g_stop = 0;
+                  if (pthread_create(&g_thr, NULL, worker, NULL) == 0) g_started = 1;
+              }
+              pthread_mutex_unlock(&g_mx);
+              return true;                      /* never fail the load, the game must start either way */
+          }
+          FB_EXPORT bool PLMod_Enable(void)  { g_active = 1; return true; }
+          FB_EXPORT bool PLMod_Disable(void) { g_active = 0; return true; }   /* stops further moves; does not undo earlier ones */
+          FB_EXPORT bool PLMod_Unload(void)  { stop_worker(); return true; }
+          FB_EXPORT bool LeviMod_Load(void)  { return PLMod_Load(); }
+          #endif
+          FPSBOOST_EOF
+
+      - name: Verify the source arrived intact
+        run: |
+          wc -l mod/fpsboost.c
+          echo "9b0dee871f2cb324a377a1eb1d17bea6373c488982ef5b1f7f5518ea2e8c22ac  mod/fpsboost.c" | sha256sum -c - || { echo "Source was damaged when pasting build.yml - paste it again completely"; exit 1; }
 
       - name: Compile 3 variants (armeabi-v7a, API 21)
         run: |
           set -eu
           NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
-          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then echo "No NDK found on this runner"; exit 1; fi
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            NDK="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          [ -d "$NDK" ] || { echo "Android NDK not found on this runner"; exit 1; }
+          echo "NDK: $NDK"
           BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           CC="$BIN/armv7a-linux-androideabi21-clang"
-          echo "NDK: $NDK"
-          "$CC" --version | head -1
-          mkdir -p out
-          build() {
-            "$CC" -std=gnu11 -O2 -Wall -Wextra -fPIC -shared -fvisibility=hidden \
-              -D"$1" -Wl,--build-id -s fpsboost.c -o "out/$2"
-          }
-          build FB_OFF     libfpsboost_off.so
-          build FB_EXP     libfpsboost.so
-          build FB_MEASURE libfpsboost_measure.so
+          "$CC" --version | head -n 1
+          if [ -x "$BIN/llvm-nm" ]; then NM="$BIN/llvm-nm"; else NM=nm; fi
+          FLAGS="-shared -fPIC -O2 -Wall -Wextra -std=gnu11 -fvisibility=hidden -Wl,--build-id -Wl,-z,noexecstack -s"
+          "$CC" $FLAGS -DFB_OFF     -o out/libfpsboost_off.so     mod/fpsboost.c
+          "$CC" $FLAGS -DFB_EXP     -o out/libfpsboost.so         mod/fpsboost.c
+          "$CC" $FLAGS -DFB_MEASURE -o out/libfpsboost_measure.so mod/fpsboost.c
+          ls -la out
 
           for f in out/*.so; do
             echo "=== $f"
-            "$BIN/llvm-readelf" -h "$f" | grep -E "Class|Machine"
-            "$BIN/llvm-readelf" -h "$f" | grep -q "ELF32" || { echo "not a 32-bit ELF"; exit 1; }
-            "$BIN/llvm-readelf" -h "$f" | grep -q "ARM"   || { echo "not ARM"; exit 1; }
-            "$BIN/llvm-nm" -D --defined-only "$f"
+            readelf -h "$f" | grep -E "Class|Machine"
+            readelf -h "$f" | grep -q "ELF32" || { echo "not a 32-bit ELF"; exit 1; }
+            readelf -h "$f" | grep -q "ARM"   || { echo "not ARM"; exit 1; }
+            "$NM" -D --defined-only "$f"
             for s in PLMod_Load PLMod_Enable PLMod_Disable PLMod_Unload; do
-              "$BIN/llvm-nm" -D --defined-only "$f" | grep -qw "$s" || { echo "missing export $s"; exit 1; }
+              "$NM" -D --defined-only "$f" | grep -qw "$s" || { echo "missing export $s"; exit 1; }
             done
             sha256sum "$f"
           done
 
           # Guarantees, checked on the real binaries:
           # the OFF build imports nothing that could do work,
-          if "$BIN/llvm-nm" -D --undefined-only out/libfpsboost_off.so | grep -E "pthread_create|fopen|sched_setaffinity|setpriority|opendir"; then
+          if "$NM" -D --undefined-only out/libfpsboost_off.so | grep -E "pthread_create|fopen|sched_setaffinity|setpriority|opendir"; then
             echo "OFF build is not empty"; exit 1
           fi
           # and the MEASURE build cannot change affinity.
-          if "$BIN/llvm-nm" -D --undefined-only out/libfpsboost_measure.so | grep -q "sched_setaffinity"; then
+          if "$NM" -D --undefined-only out/libfpsboost_measure.so | grep -q "sched_setaffinity"; then
             echo "MEASURE build can change affinity"; exit 1
           fi
           echo "checks passed"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload mods
+        uses: actions/upload-artifact@v4
         with:
           name: fpsboost-1.0
           path: out/*.so
