@@ -1,0 +1,61 @@
+name: build-fpsboost
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - fpsboost.c
+      - .github/workflows/build.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile 3 variants (armeabi-v7a, API 21)
+        run: |
+          set -eu
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then echo "No NDK found on this runner"; exit 1; fi
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC="$BIN/armv7a-linux-androideabi21-clang"
+          echo "NDK: $NDK"
+          "$CC" --version | head -1
+          mkdir -p out
+          build() {
+            "$CC" -std=gnu11 -O2 -Wall -Wextra -fPIC -shared -fvisibility=hidden \
+              -D"$1" -Wl,--build-id -s fpsboost.c -o "out/$2"
+          }
+          build FB_OFF     libfpsboost_off.so
+          build FB_EXP     libfpsboost.so
+          build FB_MEASURE libfpsboost_measure.so
+
+          for f in out/*.so; do
+            echo "=== $f"
+            "$BIN/llvm-readelf" -h "$f" | grep -E "Class|Machine"
+            "$BIN/llvm-readelf" -h "$f" | grep -q "ELF32" || { echo "not a 32-bit ELF"; exit 1; }
+            "$BIN/llvm-readelf" -h "$f" | grep -q "ARM"   || { echo "not ARM"; exit 1; }
+            "$BIN/llvm-nm" -D --defined-only "$f"
+            for s in PLMod_Load PLMod_Enable PLMod_Disable PLMod_Unload; do
+              "$BIN/llvm-nm" -D --defined-only "$f" | grep -qw "$s" || { echo "missing export $s"; exit 1; }
+            done
+            sha256sum "$f"
+          done
+
+          # Guarantees, checked on the real binaries:
+          # the OFF build imports nothing that could do work,
+          if "$BIN/llvm-nm" -D --undefined-only out/libfpsboost_off.so | grep -E "pthread_create|fopen|sched_setaffinity|setpriority|opendir"; then
+            echo "OFF build is not empty"; exit 1
+          fi
+          # and the MEASURE build cannot change affinity.
+          if "$BIN/llvm-nm" -D --undefined-only out/libfpsboost_measure.so | grep -q "sched_setaffinity"; then
+            echo "MEASURE build can change affinity"; exit 1
+          fi
+          echo "checks passed"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fpsboost-1.0
+          path: out/*.so
+          if-no-files-found: error
