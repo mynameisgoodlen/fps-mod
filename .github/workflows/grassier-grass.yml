@@ -1,0 +1,306 @@
+name: Build Grassier Grass Renderer Probe (ARMv7)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-grassier-grass-armv7.yml'
+
+permissions:
+  contents: read
+
+env:
+  ANDROID_NDK_VERSION: '28.2.13676358'
+  ANDROID_PLATFORM: 'android-29'
+  PRELOADER_COMMIT: '492de78cb0ed2c71074ba12bd41cf60862388e6c'
+
+jobs:
+  build-armv7:
+    name: Build armeabi-v7a native probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ninja-build unzip
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-29" \
+            "cmake;3.22.1" \
+            "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Fetch the pinned ARMv7 Preloader SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/mynameisgoodlen/preloader-android-32bit.git preloader
+          git -C preloader checkout --detach "$PRELOADER_COMMIT"
+          test "$(git -C preloader rev-parse HEAD)" = "$PRELOADER_COMMIT"
+
+      - name: Generate native renderer-probe source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p grassier-probe/src
+
+          cat > grassier-probe/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.22)
+          project(grassier_grass_probe LANGUAGES CXX)
+
+          if(NOT ANDROID)
+              message(FATAL_ERROR "This target must be built with the Android NDK")
+          endif()
+          if(NOT CMAKE_ANDROID_ARCH_ABI STREQUAL "armeabi-v7a")
+              message(FATAL_ERROR "Expected armeabi-v7a, got ${CMAKE_ANDROID_ARCH_ABI}")
+          endif()
+
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_CXX_EXTENSIONS OFF)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+          add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../preloader" "${CMAKE_CURRENT_BINARY_DIR}/preloader")
+
+          add_library(grassier_grass_probe SHARED src/main.cpp)
+          target_compile_options(grassier_grass_probe PRIVATE
+              -Wall -Wextra -Wno-unused-parameter
+              -fvisibility=hidden -fvisibility-inlines-hidden)
+          target_link_options(grassier_grass_probe PRIVATE "-Wl,-z,max-page-size=16384")
+
+          find_library(log-lib log REQUIRED)
+          find_library(egl-lib EGL REQUIRED)
+          find_library(gles-lib GLESv3 REQUIRED)
+          find_library(android-lib android REQUIRED)
+
+          target_link_libraries(grassier_grass_probe PRIVATE
+              preloader ${log-lib} ${egl-lib} ${gles-lib} ${android-lib} ${CMAKE_DL_LIBS})
+
+          configure_file(manifest.json.in manifest.json @ONLY)
+
+          set(PACK_ROOT "${CMAKE_CURRENT_BINARY_DIR}/package")
+          set(PACK_MOD_DIR "${PACK_ROOT}/grassier_grass_probe")
+          set(PACK_FILE "${CMAKE_CURRENT_BINARY_DIR}/grassier-grass-armv7-renderer-probe.levipack")
+
+          add_custom_target(levi_package
+              COMMAND "${CMAKE_COMMAND}" -E rm -rf "${PACK_ROOT}"
+              COMMAND "${CMAKE_COMMAND}" -E make_directory "${PACK_MOD_DIR}"
+              COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:grassier_grass_probe>" "${PACK_MOD_DIR}/libgrassier_grass_probe.so"
+              COMMAND "${CMAKE_COMMAND}" -E copy "${CMAKE_CURRENT_BINARY_DIR}/manifest.json" "${PACK_MOD_DIR}/manifest.json"
+              COMMAND "${CMAKE_COMMAND}" -E chdir "${PACK_ROOT}" "${CMAKE_COMMAND}" -E tar "cf" "${PACK_FILE}" --format=zip grassier_grass_probe
+              DEPENDS grassier_grass_probe
+              VERBATIM)
+          CMAKE
+
+          cat > grassier-probe/manifest.json.in <<'MANIFEST'
+          {
+            "type": "preload-native",
+            "name": "Grassier Grass Renderer Probe",
+            "author": "Independent LeviLauncher ARMv7 implementation",
+            "version": "0.1.0-probe",
+            "entry": "libgrassier_grass_probe.so",
+            "minecraft_versions": ["1.26.62.*"]
+          }
+          MANIFEST
+
+          cat > grassier-probe/src/main.cpp <<'CPP'
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+          #include <dlfcn.h>
+          #include <pl/Logger.hpp>
+          #include <pl/Mod.hpp>
+          #include <pl/memory/Hook.hpp>
+
+          #include <atomic>
+          #include <chrono>
+          #include <cstdint>
+          #include <utility>
+
+          namespace {
+          using SwapBuffersFn = EGLBoolean (*)(EGLDisplay, EGLSurface);
+          using DrawElementsFn = void (*)(GLenum, GLsizei, GLenum, const void *);
+
+          void *gOriginalSwapBuffers = nullptr;
+          void *gOriginalDrawElements = nullptr;
+          std::atomic<std::uint64_t> gFrames{0};
+          std::atomic<std::uint64_t> gDrawCalls{0};
+          std::atomic<std::uint64_t> gIndices{0};
+          std::atomic<GLint> gProgram{0};
+          std::atomic<GLint> gArrayBuffer{0};
+          std::atomic<GLint> gElementBuffer{0};
+          std::atomic<GLint> gTexture2D{0};
+
+          void drawElementsDetour(GLenum mode, GLsizei count, GLenum type,
+                                  const void *indices) {
+              auto original = reinterpret_cast<DrawElementsFn>(gOriginalDrawElements);
+              if (!original) return;
+
+              gDrawCalls.fetch_add(1, std::memory_order_relaxed);
+              if (count > 0) gIndices.fetch_add(static_cast<std::uint64_t>(count),
+                                                 std::memory_order_relaxed);
+
+              // Sample GL state occasionally; this probe intentionally does not
+              // modify buffers, shaders, textures, water, or terrain.
+              const auto calls = gDrawCalls.load(std::memory_order_relaxed);
+              if ((calls & 255u) == 0u) {
+                  GLint value = 0;
+                  glGetIntegerv(GL_CURRENT_PROGRAM, &value);
+                  gProgram.store(value, std::memory_order_relaxed);
+                  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &value);
+                  gArrayBuffer.store(value, std::memory_order_relaxed);
+                  glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &value);
+                  gElementBuffer.store(value, std::memory_order_relaxed);
+                  glGetIntegerv(GL_TEXTURE_BINDING_2D, &value);
+                  gTexture2D.store(value, std::memory_order_relaxed);
+              }
+              original(mode, count, type, indices);
+          }
+
+          void logRendererSample();
+
+          EGLBoolean swapBuffersDetour(EGLDisplay display, EGLSurface surface) {
+              auto original = reinterpret_cast<SwapBuffersFn>(gOriginalSwapBuffers);
+              if (!original) return EGL_FALSE;
+
+              gFrames.fetch_add(1, std::memory_order_relaxed);
+              using Clock = std::chrono::steady_clock;
+              static auto lastReport = Clock::now();
+              const auto now = Clock::now();
+              if (now - lastReport >= std::chrono::seconds(5)) {
+                  logRendererSample();
+                  lastReport = now;
+              }
+              return original(display, surface);
+          }
+
+          pl::log::Logger &probeLogger() {
+              return pl::log::Logger::getOrCreate("GrassierGrassProbe");
+          }
+
+          void logRendererSample() {
+              const auto frames = gFrames.exchange(0, std::memory_order_relaxed);
+              const auto draws = gDrawCalls.exchange(0, std::memory_order_relaxed);
+              const auto indices = gIndices.exchange(0, std::memory_order_relaxed);
+              probeLogger().info(
+                  "5s renderer sample: frames={} drawCalls={} indices={} lastGLState(program={}, arrayBuffer={}, elementBuffer={}, texture2D={})",
+                  frames, draws, indices,
+                  gProgram.load(std::memory_order_relaxed),
+                  gArrayBuffer.load(std::memory_order_relaxed),
+                  gElementBuffer.load(std::memory_order_relaxed),
+                  gTexture2D.load(std::memory_order_relaxed));
+          }
+
+          class GrassierGrassProbe final {
+          public:
+              static GrassierGrassProbe &instance() {
+                  static GrassierGrassProbe value;
+                  return value;
+              }
+
+              bool load() {
+                  probeLogger().info("Renderer probe loaded for Bedrock 1.26.62.x / ARMv7");
+                  return true;
+              }
+
+              bool enable() {
+                  mEgl = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
+                  mGles = dlopen("libGLESv3.so", RTLD_NOW | RTLD_LOCAL);
+                  if (!mEgl || !mGles) {
+                      const char *error = dlerror();
+                      probeLogger().error("Unable to open EGL/GLES libraries: {}",
+                                          error ? error : "unknown error");
+                      return false;
+                  }
+
+                  if (void *target = dlsym(mGles, "glDrawElements")) {
+                      mDrawHook = pl::memory::HookHandle(
+                          target, reinterpret_cast<void *>(&drawElementsDetour),
+                          &gOriginalDrawElements);
+                  }
+                  if (void *target = dlsym(mEgl, "eglSwapBuffers")) {
+                      mSwapHook = pl::memory::HookHandle(
+                          target, reinterpret_cast<void *>(&swapBuffersDetour),
+                          &gOriginalSwapBuffers);
+                  }
+
+                  probeLogger().info("Hook status: eglSwapBuffers={} glDrawElements={}",
+                                     mSwapHook.installed(), mDrawHook.installed());
+                  return mSwapHook.installed() && mDrawHook.installed();
+              }
+
+              bool disable() {
+                  mDrawHook.reset();
+                  mSwapHook.reset();
+                  gOriginalDrawElements = nullptr;
+                  gOriginalSwapBuffers = nullptr;
+                  return true;
+              }
+
+              bool unload() {
+                  disable();
+                  if (mGles) { dlclose(mGles); mGles = nullptr; }
+                  if (mEgl) { dlclose(mEgl); mEgl = nullptr; }
+                  probeLogger().info("Renderer probe unloaded");
+                  return true;
+              }
+
+          private:
+              void *mEgl{};
+              void *mGles{};
+              pl::memory::HookHandle mSwapHook;
+              pl::memory::HookHandle mDrawHook;
+          };
+          } // namespace
+
+          PL_REGISTER_MOD(GrassierGrassProbe, GrassierGrassProbe::instance());
+          CPP
+
+          # Keep source indentation valid after YAML's block indentation is removed.
+          sed -i 's/^          //' grassier-probe/CMakeLists.txt grassier-probe/manifest.json.in grassier-probe/src/main.cpp
+
+      - name: Configure ARMv7 build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S grassier-probe -B build/grassier-armv7 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM="${ANDROID_PLATFORM}" \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compile and package
+        run: cmake --build build/grassier-armv7 --target levi_package --parallel 2
+
+      - name: Verify ARMv7 package
+        shell: bash
+        run: |
+          set -euo pipefail
+          SO="$(find build/grassier-armv7 -name 'libgrassier_grass_probe.so' -type f -print -quit)"
+          test -n "$SO"
+          readelf -h "$SO" | tee /tmp/elf-header.txt
+          grep -q 'Class:.*ELF32' /tmp/elf-header.txt
+          grep -q 'Machine:.*ARM' /tmp/elf-header.txt
+          PACK='build/grassier-armv7/grassier-grass-armv7-renderer-probe.levipack'
+          test -s "$PACK"
+          unzip -t "$PACK"
+          unzip -Z1 "$PACK" | grep -qx 'grassier_grass_probe/manifest.json'
+          unzip -Z1 "$PACK" | grep -qx 'grassier_grass_probe/libgrassier_grass_probe.so'
+
+      - name: Upload ARMv7 renderer probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: grassier-grass-armv7-renderer-probe
+          path: build/grassier-armv7/grassier-grass-armv7-renderer-probe.levipack
+          if-no-files-found: error
+          retention-days: 30
